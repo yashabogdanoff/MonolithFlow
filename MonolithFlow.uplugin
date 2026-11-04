@@ -1,0 +1,34 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "0.16.0",
+	"FriendlyName": "Monolith Flow",
+	"Description": "Sibling plugin bridging the MothCocoon Flow plugin into the Monolith MCP registry. Registers the `flow` namespace (flow_query tool): asset listing, graph walks + analysis (execution reachability, one-call graph export, asset diff), cross-asset reverse lookups, a node-class registry, full graph authoring (create/add/edit/wire/remove/comment, transactional), a layered auto-layout formatter, data validation, and PIE runtime introspection - backed by a Flow indexer feeding Monolith's central SQLite project index. Compiles to an inactive stub when the Flow plugin is absent.",
+	"Category": "Editor",
+	"CreatedBy": "Arystan Kudaibergenov",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": true,
+	"Plugins": [
+		{
+			"Name": "Monolith",
+			"Enabled": true
+		},
+		{
+			"Name": "Flow",
+			"Enabled": true,
+			"Optional": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "MonolithFlow",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

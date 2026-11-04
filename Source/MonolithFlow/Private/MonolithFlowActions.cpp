@@ -13,6 +13,9 @@
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
+#include "Nodes/Graph/FlowNode_CustomInput.h"
+#include "Nodes/Graph/FlowNode_Start.h"
 
 // ============================================================================
 // Local helpers
@@ -20,9 +23,20 @@
 
 namespace
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Set by FScopedDatabaseOverride. */
+	FSQLiteDatabase* GDatabaseOverride = nullptr;
+#endif
+
 	/** Fetch the SQLite raw handle, or set OutError + return null. */
 	FSQLiteDatabase* GetRawDB(FString& OutError)
 	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (GDatabaseOverride)
+		{
+			return GDatabaseOverride;
+		}
+#endif
 		if (!GEditor)
 		{
 			OutError = TEXT("GEditor not available");
@@ -43,10 +57,16 @@ namespace
 		return RawDB;
 	}
 
-	/** Convert a glob pattern (* / ?) to SQL LIKE with single-quote escape. */
+	/**
+	 * Convert a glob pattern (* / ?) to a SQL LIKE pattern for use with ESCAPE '\'.
+	 * `%`, `_` and `\` in the input are literal - an asset named A_B must not match AxB.
+	 */
 	FString GlobToLike(const FString& Glob)
 	{
 		return Glob
+			.Replace(TEXT("\\"), TEXT("\\\\"))
+			.Replace(TEXT("%"), TEXT("\\%"))
+			.Replace(TEXT("_"), TEXT("\\_"))
 			.Replace(TEXT("'"), TEXT("''"))
 			.Replace(TEXT("*"), TEXT("%"))
 			.Replace(TEXT("?"), TEXT("_"));
@@ -108,6 +128,75 @@ namespace
 		Stmt.Destroy();
 	}
 
+	/** Node guids are stored hyphenated upper case; accept any form FGuid parses (unparsable input is left alone and matches nothing). */
+	FString CanonicalGuid(const FString& In)
+	{
+		FGuid Guid;
+		return FGuid::Parse(In, Guid) ? Guid.ToString(EGuidFormats::DigitsWithHyphens) : In;
+	}
+
+	/** An optional enum-like param: empty means the default, anything else must be one of Allowed. */
+	bool OneOf(const FString& Value, std::initializer_list<const TCHAR*> Allowed)
+	{
+		if (Value.IsEmpty()) return true;
+		for (const TCHAR* Option : Allowed)
+		{
+			if (Value == Option) return true;
+		}
+		return false;
+	}
+
+	/** Text of a JSON value as searched: a string as is, anything else serialized. */
+	FString JsonValueText(const TSharedPtr<FJsonValue>& Value)
+	{
+		FString Text;
+		if (!Value.IsValid() || Value->TryGetString(Text))
+		{
+			return Text;
+		}
+		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
+		FJsonSerializer::Serialize(Value, FString(), Writer);
+		return Text;
+	}
+
+	/** Does any field named PropName (case-insensitive, any depth) hold a value containing Needle? */
+	bool PropertyValueContains(const TSharedPtr<FJsonValue>& Value, const FString& PropName, const FString& Needle)
+	{
+		if (!Value.IsValid())
+		{
+			return false;
+		}
+		const TSharedPtr<FJsonObject>* Object = nullptr;
+		if (Value->TryGetObject(Object))
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Object)->Values)
+			{
+				if (Pair.Key.Equals(PropName, ESearchCase::IgnoreCase) && JsonValueText(Pair.Value).Contains(Needle, ESearchCase::CaseSensitive))
+				{
+					return true;
+				}
+				if (PropertyValueContains(Pair.Value, PropName, Needle))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Array = nullptr;
+		if (Value->TryGetArray(Array))
+		{
+			for (const TSharedPtr<FJsonValue>& Item : *Array)
+			{
+				if (PropertyValueContains(Item, PropName, Needle))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	/** Try parse a JSON string into a JsonValue (object/array); returns null JsonValue on failure. */
 	TSharedPtr<FJsonValue> TryParseJsonValue(const FString& JsonStr)
 	{
@@ -124,6 +213,19 @@ namespace
 		return Out;
 	}
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+FMonolithFlowActions::FScopedDatabaseOverride::FScopedDatabaseOverride(FSQLiteDatabase* Database)
+	: Previous(GDatabaseOverride)
+{
+	GDatabaseOverride = Database;
+}
+
+FMonolithFlowActions::FScopedDatabaseOverride::~FScopedDatabaseOverride()
+{
+	GDatabaseOverride = Previous;
+}
+#endif
 
 // ============================================================================
 // Registration
@@ -265,11 +367,19 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("diff_assets"),
-		TEXT("Structural diff of two Flow Assets by node guid: nodes only in A, only in B, nodes present in both whose class or data JSON differs, and execution edges added/removed. Useful for comparing scenario variants or verifying a refactor. Reads the index - save both assets first."),
+		TEXT("Structural diff of two Flow Assets by node guid: nodes only in A, only in B, nodes present in both whose class or data JSON differs, and edges added/removed. Meant for two versions of one graph (before/after a refactor, a variant copied on disk): Flow mints new node guids when an asset is duplicated in the editor, so such a copy shares no nodes with its source - shared_node_count is then 0 and a note says so. Reads the index - save both assets first."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::DiffAssets),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path_a"), TEXT("string"), TEXT("UFlowAsset object or package path (baseline)"))
 			.Required(TEXT("asset_path_b"), TEXT("string"), TEXT("UFlowAsset object or package path (compared)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("get_node_history"),
+		TEXT("Earlier property snapshots of nodes whose re-index lost properties - typically a UPROPERTY removed or renamed in C++, after which the engine can no longer read the old values. Newest first, last 5 per node, each with removed_properties, the time the snapshot was taken and the full data JSON; feed values back with set_node_properties. Needs Keep Property History in the plugin settings (on by default)."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::GetNodeHistory),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object (/Pkg/Name.Name) or package path (/Pkg/Name)"))
+			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Limit to one node"))
 			.Build());
 }
 
@@ -307,7 +417,7 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 	FString Where;
 	if (!PathFilter.IsEmpty())
 	{
-		Where = FString::Printf(TEXT(" WHERE fa_path LIKE '%s'"), *GlobToLike(PathFilter));
+		Where = FString::Printf(TEXT(" WHERE fa_path LIKE '%s' ESCAPE '\\'"), *GlobToLike(PathFilter));
 	}
 
 	int64 Total = 0;
@@ -323,7 +433,7 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 
 	const FString SQL = FString(TEXT(
 		"SELECT fa_path, name, asset_class, expected_owner_class, base_params_path, "
-		"world_bound, node_count, addon_count, subgraph_count "
+		"world_bound, node_count, addon_count, subgraph_count, indexed_at "
 		"FROM flow_assets"))
 		+ Where
 		+ FString::Printf(TEXT(" ORDER BY fa_path LIMIT %d OFFSET %d"), Limit, Offset);
@@ -348,6 +458,8 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 		Stmt.GetColumnValueByIndex(6, NodeCount);
 		Stmt.GetColumnValueByIndex(7, AddonCount);
 		Stmt.GetColumnValueByIndex(8, SubgraphCount);
+		FString IndexedAt;
+		Stmt.GetColumnValueByIndex(9, IndexedAt);
 
 		auto Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("fa_path"), FaPath);
@@ -359,6 +471,7 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 		Row->SetNumberField(TEXT("node_count"), NodeCount);
 		Row->SetNumberField(TEXT("addon_count"), AddonCount);
 		Row->SetNumberField(TEXT("subgraph_count"), SubgraphCount);
+		if (!IndexedAt.IsEmpty()) Row->SetStringField(TEXT("indexed_at"), IndexedAt);
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 	Stmt.Destroy();
@@ -401,7 +514,7 @@ FMonolithActionResult FMonolithFlowActions::GetAssetInfo(const TSharedPtr<FJsonO
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(*RawDB, TEXT(
 			"SELECT name, asset_class, asset_guid, expected_owner_class, base_params_path, "
-			"world_bound, node_count, addon_count, subgraph_count "
+			"world_bound, node_count, addon_count, subgraph_count, indexed_at "
 			"FROM flow_assets WHERE id = ?")))
 		{
 			return FMonolithActionResult::Error(TEXT("Failed to prepare get_asset_info header SQL"));
@@ -420,6 +533,9 @@ FMonolithActionResult FMonolithFlowActions::GetAssetInfo(const TSharedPtr<FJsonO
 			Stmt.GetColumnValueByIndex(6, NodeCount);
 			Stmt.GetColumnValueByIndex(7, AddonCount);
 			Stmt.GetColumnValueByIndex(8, SubgraphCount);
+			FString IndexedAt;
+			Stmt.GetColumnValueByIndex(9, IndexedAt);
+			if (!IndexedAt.IsEmpty()) Result->SetStringField(TEXT("indexed_at"), IndexedAt);
 
 			Result->SetStringField(TEXT("fa_path"), AssetPath);
 			Result->SetStringField(TEXT("name"), Name);
@@ -644,7 +760,7 @@ namespace
 		TArray<TSharedPtr<FJsonValue>> Out;
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(*RawDB, TEXT(
-			"SELECT from_pin, to_node_guid, to_pin, is_orphaned "
+			"SELECT from_pin, to_node_guid, to_pin, is_orphaned, kind "
 			"FROM flow_node_connections WHERE fa_asset_id = ? AND from_node_guid = ? "
 			"ORDER BY from_pin, to_node_guid")))
 		{
@@ -660,12 +776,15 @@ namespace
 			Stmt.GetColumnValueByIndex(1, ToGuid);
 			Stmt.GetColumnValueByIndex(2, ToPin);
 			Stmt.GetColumnValueByIndex(3, Orphan);
+			FString Kind;
+			Stmt.GetColumnValueByIndex(4, Kind);
 
 			auto Row = MakeShared<FJsonObject>();
 			Row->SetStringField(TEXT("from_pin"), FromPin);
 			Row->SetStringField(TEXT("to_node_guid"), ToGuid);
 			Row->SetStringField(TEXT("to_pin"), ToPin);
 			if (Orphan != 0) Row->SetBoolField(TEXT("is_orphaned"), true);
+			Row->SetStringField(TEXT("kind"), Kind.IsEmpty() ? TEXT("exec") : Kind);
 			Out.Add(MakeShared<FJsonValueObject>(Row));
 		}
 		Stmt.Destroy();
@@ -794,6 +913,8 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 	FString NodeGuid, Direction, PinTypeName;
 	Params->TryGetStringField(TEXT("node_guid"), NodeGuid);
 	Params->TryGetStringField(TEXT("pin_direction"), Direction);
+	NodeGuid = CanonicalGuid(NodeGuid);
+	if (!OneOf(Direction, { TEXT("input"), TEXT("output") })) return FMonolithActionResult::Error(TEXT("pin_direction must be input or output"));
 	Params->TryGetStringField(TEXT("pin_type_name"), PinTypeName);
 
 	FString SQL = TEXT(
@@ -888,9 +1009,11 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 	FString FromGuid, ToGuid;
 	Params->TryGetStringField(TEXT("from_node_guid"), FromGuid);
 	Params->TryGetStringField(TEXT("to_node_guid"), ToGuid);
+	FromGuid = CanonicalGuid(FromGuid);
+	ToGuid = CanonicalGuid(ToGuid);
 
 	FString SQL = TEXT(
-		"SELECT from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned "
+		"SELECT from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned, kind "
 		"FROM flow_node_connections WHERE fa_asset_id = ?");
 	int32 NextBind = 2;
 	if (!FromGuid.IsEmpty()) SQL += TEXT(" AND from_node_guid = ?");
@@ -917,6 +1040,8 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 		Stmt.GetColumnValueByIndex(2, ToG);
 		Stmt.GetColumnValueByIndex(3, ToP);
 		Stmt.GetColumnValueByIndex(4, Orphan);
+		FString Kind;
+		Stmt.GetColumnValueByIndex(5, Kind);
 
 		auto Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("from_node_guid"), FromG);
@@ -924,6 +1049,7 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 		Row->SetStringField(TEXT("to_node_guid"), ToG);
 		Row->SetStringField(TEXT("to_pin"), ToP);
 		if (Orphan != 0) { Row->SetBoolField(TEXT("is_orphaned"), true); ++OrphanCount; }
+		Row->SetStringField(TEXT("kind"), Kind.IsEmpty() ? TEXT("exec") : Kind);
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 	Stmt.Destroy();
@@ -958,6 +1084,7 @@ FMonolithActionResult FMonolithFlowActions::ListAddons(const TSharedPtr<FJsonObj
 
 	FString NodeGuid;
 	Params->TryGetStringField(TEXT("node_guid"), NodeGuid);
+	NodeGuid = CanonicalGuid(NodeGuid);
 
 	FString SQL = TEXT(
 		"SELECT id, owner_node_guid, parent_addon_id, addon_class, addon_index, depth, data "
@@ -1020,6 +1147,7 @@ FMonolithActionResult FMonolithFlowActions::GetNodeInfo(const TSharedPtr<FJsonOb
 	{
 		return FMonolithActionResult::Error(TEXT("node_guid is required"));
 	}
+	NodeGuid = CanonicalGuid(NodeGuid);
 
 	int64 RowId = -1, AssetId = -1;
 	SelectFlowAssetIds(RawDB, AssetPath, RowId, AssetId);
@@ -1106,6 +1234,7 @@ FMonolithActionResult FMonolithFlowActions::ListCustomEvents(const TSharedPtr<FJ
 
 	FString Kind;
 	Params->TryGetStringField(TEXT("kind"), Kind);
+	if (!OneOf(Kind, { TEXT("input"), TEXT("output"), TEXT("all") })) return FMonolithActionResult::Error(TEXT("kind must be input, output or all"));
 
 	FString SQL = TEXT("SELECT kind, event_name FROM flow_custom_events WHERE fa_asset_id = ?");
 	if (!Kind.IsEmpty() && Kind != TEXT("all"))
@@ -1167,7 +1296,7 @@ FMonolithActionResult FMonolithFlowActions::FindSubgraphCallers(const TSharedPtr
 	if (!PathFilter.IsEmpty())
 	{
 		const FString Like = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" AND host_fa_path LIKE '%s'"), *Like);
+		SQL += FString::Printf(TEXT(" AND host_fa_path LIKE '%s' ESCAPE '\\'"), *Like);
 	}
 	SQL += TEXT(" ORDER BY host_fa_path, host_node_guid");
 
@@ -1226,7 +1355,7 @@ FMonolithActionResult FMonolithFlowActions::FindNodeClassUsages(const TSharedPtr
 	if (!PathFilter.IsEmpty())
 	{
 		const FString Like = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *Like);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s' ESCAPE '\\'"), *Like);
 	}
 	SQL += TEXT(" ORDER BY fa.fa_path, n.node_guid");
 
@@ -1289,6 +1418,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 	FString SubCat, Direction, PathFilter;
 	Params->TryGetStringField(TEXT("pin_subcategory_object"), SubCat);
 	Params->TryGetStringField(TEXT("pin_direction"), Direction);
+	if (!OneOf(Direction, { TEXT("input"), TEXT("output") })) return FMonolithActionResult::Error(TEXT("pin_direction must be input or output"));
 	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
 
 	FString SQL = TEXT(
@@ -1309,7 +1439,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 	if (!PathFilter.IsEmpty())
 	{
 		const FString Like = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *Like);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s' ESCAPE '\\'"), *Like);
 	}
 	SQL += TEXT(" ORDER BY fa.fa_path, p.node_guid, p.pin_direction, p.pin_index");
 
@@ -1425,7 +1555,7 @@ FMonolithActionResult FMonolithFlowActions::FindNodesByProperty(const TSharedPtr
 	if (!PathFilter.IsEmpty())
 	{
 		const FString FaLike = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *FaLike);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s' ESCAPE '\\'"), *FaLike);
 	}
 	SQL += TEXT(" ORDER BY fa.fa_path, n.node_guid");
 
@@ -1448,11 +1578,19 @@ FMonolithActionResult FMonolithFlowActions::FindNodesByProperty(const TSharedPtr
 		Stmt.GetColumnValueByIndex(3, Display);
 		Stmt.GetColumnValueByIndex(4, DataJson);
 
+		// The LIKE above is only a prefilter: `"name"...value` also matches a value
+		// that sits in a later property. Confirm against the parsed snapshot.
+		const TSharedPtr<FJsonValue> Data = TryParseJsonValue(DataJson);
+		if (!PropName.IsEmpty() && !PropertyValueContains(Data, PropName, ValueSub))
+		{
+			continue;
+		}
+
 		auto NodeObj = MakeShared<FJsonObject>();
 		NodeObj->SetStringField(TEXT("node_guid"), Guid);
 		NodeObj->SetStringField(TEXT("node_class"), Cls);
 		if (!Display.IsEmpty()) NodeObj->SetStringField(TEXT("display_name"), Display);
-		NodeObj->SetField(TEXT("data"), TryParseJsonValue(DataJson));
+		NodeObj->SetField(TEXT("data"), Data);
 
 		NodesByFa.FindOrAdd(FaPath).Add(MakeShared<FJsonValueObject>(NodeObj));
 		++TotalNodes;
@@ -1489,6 +1627,8 @@ FMonolithActionResult FMonolithFlowActions::ListNodeClasses(const TSharedPtr<FJs
 	{
 		Params->TryGetStringField(TEXT("kind"), Kind);
 		Params->TryGetStringField(TEXT("source"), Source);
+		if (!OneOf(Kind, { TEXT("node"), TEXT("addon"), TEXT("all") })) return FMonolithActionResult::Error(TEXT("kind must be node, addon or all"));
+		if (!OneOf(Source, { TEXT("blueprint"), TEXT("native"), TEXT("all") })) return FMonolithActionResult::Error(TEXT("source must be blueprint, native or all"));
 		Params->TryGetStringField(TEXT("class_path_filter"), PathFilter);
 	}
 
@@ -1510,7 +1650,7 @@ FMonolithActionResult FMonolithFlowActions::ListNodeClasses(const TSharedPtr<FJs
 	if (!PathFilter.IsEmpty())
 	{
 		const FString Like = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" AND class_path LIKE '%s'"), *Like);
+		SQL += FString::Printf(TEXT(" AND class_path LIKE '%s' ESCAPE '\\'"), *Like);
 	}
 	SQL += TEXT(" ORDER BY is_native, kind, class_path");
 
@@ -1591,6 +1731,7 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 
 	FString StartGuid;
 	Params->TryGetStringField(TEXT("start_node_guid"), StartGuid);
+	StartGuid = CanonicalGuid(StartGuid);
 
 	// Node identity map: guid -> (class, display)
 	struct FNodeRow { FString Class; FString Display; };
@@ -1620,7 +1761,7 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(*RawDB, TEXT(
 			"SELECT from_node_guid, to_node_guid FROM flow_node_connections "
-			"WHERE fa_asset_id = ? AND is_orphaned = 0")))
+			"WHERE fa_asset_id = ? AND is_orphaned = 0 AND kind = 'exec'")))
 		{
 			return FMonolithActionResult::Error(TEXT("Failed to prepare walk_execution edges SQL"));
 		}
@@ -1648,14 +1789,24 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 	}
 	else
 	{
+		// Subclasses count too (a project's own Start); a class that is not loaded is matched by path only.
+		auto IsEntryClass = [](const FString& ClassPath)
+		{
+			if (ClassPath == TEXT("/Script/Flow.FlowNode_Start") || ClassPath == TEXT("/Script/Flow.FlowNode_CustomInput"))
+			{
+				return true;
+			}
+			const UClass* NodeClass = FindObject<UClass>(nullptr, *ClassPath);
+			return NodeClass && (NodeClass->IsChildOf(UFlowNode_Start::StaticClass()) || NodeClass->IsChildOf(UFlowNode_CustomInput::StaticClass()));
+		};
 		for (const TPair<FString, FNodeRow>& Pair : NodeRows)
 		{
-			if (Pair.Value.Class == TEXT("/Script/Flow.FlowNode_Start") ||
-				Pair.Value.Class == TEXT("/Script/Flow.FlowNode_CustomInput"))
+			if (IsEntryClass(Pair.Value.Class))
 			{
 				Frontier.Add(Pair.Key);
 			}
 		}
+		Frontier.Sort();
 		if (Frontier.IsEmpty())
 		{
 			return FMonolithActionResult::Error(FString::Printf(
@@ -1673,6 +1824,7 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 		const int32 NextDepth = Depth[Current] + 1;
 		TArray<FString> Targets;
 		Adjacency.MultiFind(Current, Targets);
+		Targets.Sort();
 		for (const FString& Target : Targets)
 		{
 			if (!Depth.Contains(Target) && NodeRows.Contains(Target))
@@ -1694,7 +1846,10 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 		Row->SetNumberField(TEXT("depth"), Depth[Guid]);
 		ReachedRows.Add(MakeShared<FJsonValueObject>(Row));
 
-		if (!Adjacency.Contains(Guid))
+		// Terminal: no edge leads to a node of this graph (an edge to a missing node leads nowhere).
+		TArray<FString> Targets;
+		Adjacency.MultiFind(Guid, Targets);
+		if (!Targets.ContainsByPredicate([&NodeRows](const FString& Target) { return NodeRows.Contains(Target); }))
 		{
 			auto TermRow = MakeShared<FJsonObject>();
 			TermRow->SetStringField(TEXT("node_guid"), Guid);
@@ -1703,13 +1858,19 @@ FMonolithActionResult FMonolithFlowActions::WalkExecution(const TSharedPtr<FJson
 			TerminalRows.Add(MakeShared<FJsonValueObject>(TermRow));
 		}
 	}
+	TArray<FString> Unreached;
 	for (const TPair<FString, FNodeRow>& Pair : NodeRows)
 	{
-		if (Depth.Contains(Pair.Key)) continue;
+		if (!Depth.Contains(Pair.Key)) Unreached.Add(Pair.Key);
+	}
+	Unreached.Sort();
+	for (const FString& Guid : Unreached)
+	{
+		const FNodeRow& Info = NodeRows[Guid];
 		auto Row = MakeShared<FJsonObject>();
-		Row->SetStringField(TEXT("node_guid"), Pair.Key);
-		Row->SetStringField(TEXT("node_class"), Pair.Value.Class);
-		Row->SetStringField(TEXT("display_name"), Pair.Value.Display);
+		Row->SetStringField(TEXT("node_guid"), Guid);
+		Row->SetStringField(TEXT("node_class"), Info.Class);
+		Row->SetStringField(TEXT("display_name"), Info.Display);
 		UnreachableRows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 
@@ -1832,7 +1993,7 @@ FMonolithActionResult FMonolithFlowActions::ExportGraph(const TSharedPtr<FJsonOb
 		TArray<TSharedPtr<FJsonValue>> Rows;
 		FSQLitePreparedStatement Stmt;
 		if (Stmt.Create(*RawDB, TEXT(
-			"SELECT from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned "
+			"SELECT from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned, kind "
 			"FROM flow_node_connections WHERE fa_asset_id = ? ORDER BY from_node_guid, from_pin")))
 		{
 			Stmt.SetBindingValueByIndex(1, AssetId);
@@ -1845,6 +2006,8 @@ FMonolithActionResult FMonolithFlowActions::ExportGraph(const TSharedPtr<FJsonOb
 				Stmt.GetColumnValueByIndex(2, ToG);
 				Stmt.GetColumnValueByIndex(3, ToP);
 				Stmt.GetColumnValueByIndex(4, Orphan);
+				FString Kind;
+				Stmt.GetColumnValueByIndex(5, Kind);
 
 				auto Row = MakeShared<FJsonObject>();
 				Row->SetStringField(TEXT("from"), FromG);
@@ -1852,6 +2015,7 @@ FMonolithActionResult FMonolithFlowActions::ExportGraph(const TSharedPtr<FJsonOb
 				Row->SetStringField(TEXT("to"), ToG);
 				Row->SetStringField(TEXT("to_pin"), ToP);
 				if (Orphan != 0) Row->SetBoolField(TEXT("is_orphaned"), true);
+				Row->SetStringField(TEXT("kind"), Kind.IsEmpty() ? TEXT("exec") : Kind);
 				Rows.Add(MakeShared<FJsonValueObject>(Row));
 			}
 			Stmt.Destroy();
@@ -2054,9 +2218,89 @@ FMonolithActionResult FMonolithFlowActions::DiffAssets(const TSharedPtr<FJsonObj
 	Result->SetArrayField(TEXT("nodes_changed"), Changed);
 	Result->SetArrayField(TEXT("edges_removed"), EdgesRemoved);
 	Result->SetArrayField(TEXT("edges_added"), EdgesAdded);
+	const int32 SharedNodeCount = NodesA.Num() - OnlyInA.Num();
+	Result->SetNumberField(TEXT("shared_node_count"), SharedNodeCount);
+	if (SharedNodeCount == 0 && NodesA.Num() > 0 && NodesB.Num() > 0)
+	{
+		Result->SetStringField(TEXT("note"), TEXT("The assets share no node guids. Nodes are matched by guid, and Flow assigns new guids when an asset is duplicated in the editor, so a duplicate reads as a different graph."));
+	}
 	Result->SetBoolField(TEXT("identical"),
 		OnlyInA.Num() == 0 && OnlyInB.Num() == 0 && Changed.Num() == 0
 		&& EdgesRemoved.Num() == 0 && EdgesAdded.Num() == 0);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::GetNodeHistory(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString AssetPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+	AssetPath = ToFlowObjectPath(AssetPath);
+
+	FString NodeFilter;
+	if (Params->TryGetStringField(TEXT("node_guid"), NodeFilter) && !NodeFilter.IsEmpty())
+	{
+		FGuid Guid;
+		if (!FGuid::Parse(NodeFilter, Guid))
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid node guid: %s"), *NodeFilter));
+		}
+		NodeFilter = Guid.ToString(EGuidFormats::DigitsWithHyphens);
+	}
+
+	FSQLitePreparedStatement Stmt;
+	const bool bPrepared = NodeFilter.IsEmpty()
+		? Stmt.Create(*RawDB, TEXT("SELECT node_guid, node_class, indexed_at, removed_properties, data FROM flow_node_history WHERE fa_path = ? ORDER BY id DESC"))
+		: Stmt.Create(*RawDB, TEXT("SELECT node_guid, node_class, indexed_at, removed_properties, data FROM flow_node_history WHERE fa_path = ? AND node_guid = ? ORDER BY id DESC"));
+	if (!bPrepared)
+	{
+		// The table appears with the first index pass of a plugin version that has it.
+		auto Empty = MakeShared<FJsonObject>();
+		Empty->SetStringField(TEXT("fa_path"), AssetPath);
+		Empty->SetArrayField(TEXT("snapshots"), {});
+		Empty->SetNumberField(TEXT("count"), 0);
+		return FMonolithActionResult::Success(Empty);
+	}
+	Stmt.SetBindingValueByIndex(1, AssetPath);
+	if (!NodeFilter.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(2, NodeFilter);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString Guid, NodeClass, IndexedAt, Removed, Data;
+		Stmt.GetColumnValueByIndex(0, Guid);
+		Stmt.GetColumnValueByIndex(1, NodeClass);
+		Stmt.GetColumnValueByIndex(2, IndexedAt);
+		Stmt.GetColumnValueByIndex(3, Removed);
+		Stmt.GetColumnValueByIndex(4, Data);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("node_guid"), Guid);
+		Row->SetStringField(TEXT("node_class"), NodeClass);
+		if (!IndexedAt.IsEmpty()) Row->SetStringField(TEXT("snapshot_indexed_at"), IndexedAt);
+		TArray<TSharedPtr<FJsonValue>> RemovedValues;
+		TArray<FString> RemovedNames;
+		Removed.ParseIntoArray(RemovedNames, TEXT(","));
+		for (const FString& Name : RemovedNames) RemovedValues.Add(MakeShared<FJsonValueString>(Name));
+		Row->SetArrayField(TEXT("removed_properties"), RemovedValues);
+		Row->SetField(TEXT("data"), TryParseJsonValue(Data));
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("fa_path"), AssetPath);
+	Result->SetArrayField(TEXT("snapshots"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
 	return FMonolithActionResult::Success(Result);
 }
 

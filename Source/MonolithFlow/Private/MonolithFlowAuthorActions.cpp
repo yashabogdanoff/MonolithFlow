@@ -29,6 +29,7 @@
 #include "Misc/DataValidation.h"
 #include "JsonObjectConverter.h"
 #include "Misc/OutputDeviceNull.h"
+#include "Misc/PackageName.h"
 #include "UObject/StructOnScope.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
@@ -138,7 +139,17 @@ namespace
 		{
 			return Expect(Type == EJson::String, TEXT("string"));
 		}
-		if (CastField<FObjectPropertyBase>(Prop) || CastField<FSoftObjectProperty>(Prop) || CastField<FInterfaceProperty>(Prop))
+		if (const FObjectPropertyBase* ObjectProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			// An instanced subobject is written inline into the snapshot (an object with
+			// _ClassName), so the same shape has to be accepted on the way back in.
+			const bool bInstanced = Prop->HasAnyPropertyFlags(CPF_InstancedReference | CPF_PersistentInstance)
+				|| (ObjectProp->PropertyClass && ObjectProp->PropertyClass->HasAnyClassFlags(CLASS_DefaultToInstanced | CLASS_EditInlineNew));
+			return bInstanced
+				? Expect(Type == EJson::String || Type == EJson::Null || Type == EJson::Object, TEXT("object path string, inline object or null"))
+				: Expect(Type == EJson::String || Type == EJson::Null, TEXT("object path string or null"));
+		}
+		if (CastField<FInterfaceProperty>(Prop))
 		{
 			return Expect(Type == EJson::String || Type == EJson::Null, TEXT("object path string or null"));
 		}
@@ -168,7 +179,15 @@ namespace
 	 * corrupt the node; and each value must have the JSON shape of its property.
 	 * Nested struct members are left to the converter.
 	 */
-	bool ValidatePropertyKeys(const UClass* Cls, const TSharedPtr<FJsonObject>& Props, FString& OutError)
+	/** A failed edit: a stable code for callers that branch on it, and text for people. */
+	struct FEditError
+	{
+		FString Code;
+		FString Message;
+		int32 OpIndex = INDEX_NONE;
+	};
+
+	bool ValidatePropertyKeys(const UClass* Cls, const TSharedPtr<FJsonObject>& Props, FEditError& OutError)
 	{
 		TArray<FString> Unknown, ReadOnly, WrongShape;
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
@@ -187,22 +206,22 @@ namespace
 				WrongShape.Add(FString::Printf(TEXT("%s (expects %s)"), *Pair.Key, Expected));
 			}
 		}
-		if (WrongShape.Num() > 0 && Unknown.Num() == 0 && ReadOnly.Num() == 0)
-		{
-			OutError = FString::Printf(TEXT("Values of the wrong JSON type for %s: %s"),
-				*Cls->GetName(), *FString::Join(WrongShape, TEXT(", ")));
-			return false;
-		}
 		if (Unknown.Num() > 0)
 		{
-			OutError = FString::Printf(TEXT("Unknown properties on %s: %s"),
-				*Cls->GetName(), *FString::Join(Unknown, TEXT(", ")));
+			OutError = { TEXT("unknown_property"), FString::Printf(TEXT("Unknown properties on %s: %s"),
+				*Cls->GetName(), *FString::Join(Unknown, TEXT(", "))) };
 			return false;
 		}
 		if (ReadOnly.Num() > 0)
 		{
-			OutError = FString::Printf(TEXT("Properties of %s that are not editable in the Details panel: %s"),
-				*Cls->GetName(), *FString::Join(ReadOnly, TEXT(", ")));
+			OutError = { TEXT("read_only_property"), FString::Printf(TEXT("Properties of %s that are not editable in the Details panel: %s"),
+				*Cls->GetName(), *FString::Join(ReadOnly, TEXT(", "))) };
+			return false;
+		}
+		if (WrongShape.Num() > 0)
+		{
+			OutError = { TEXT("wrong_type"), FString::Printf(TEXT("Values of the wrong JSON type for %s: %s"),
+				*Cls->GetName(), *FString::Join(WrongShape, TEXT(", "))) };
 			return false;
 		}
 		return true;
@@ -214,7 +233,7 @@ namespace
 	 * notification an edit in the Details panel sends, so nodes that rebuild pins
 	 * or caches on a specific property see it.
 	 */
-	bool ApplyPropertiesJson(UObject* Target, const TSharedPtr<FJsonObject>& Props, FString& OutError)
+	bool ApplyPropertiesJson(UObject* Target, const TSharedPtr<FJsonObject>& Props, FEditError& OutError)
 	{
 		TArray<FProperty*> Changed;
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
@@ -237,8 +256,8 @@ namespace
 
 		if (!bApplied)
 		{
-			OutError = FString::Printf(TEXT("Failed to apply property JSON to %s (a value does not match its property type)"),
-				*Target->GetClass()->GetName());
+			OutError = { TEXT("apply_failed"), FString::Printf(TEXT("Failed to apply property JSON to %s (a value does not match its property type)"),
+				*Target->GetClass()->GetName()) };
 			return false;
 		}
 		return true;
@@ -274,14 +293,6 @@ namespace
 				return false;
 			}
 			return GEditor->UndoTransaction(/*bCanRedo=*/false);
-		}
-
-		/** Error text for a failed mutation, saying whether the graph is back to where it was. */
-		FString RollBackAndExplain(const FString& Error) const
-		{
-			return RollBack()
-				? Error + TEXT(" - the change was rolled back")
-				: Error + TEXT(" - the change could NOT be rolled back, check the graph (editor Undo may revert it)");
 		}
 	};
 
@@ -329,7 +340,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("save_asset"),
-		TEXT("Save one Flow Asset to disk. Saving also refreshes the flow_* index tables via the live incremental indexer, so read actions see the change."),
+		TEXT("Save one Flow Asset to disk. Saving also refreshes the flow_* index tables via the live incremental indexer, so read actions see the change. Data validation that the engine or Flow 2.4 runs on save only writes to the editor log and never blocks the save - call validate_asset to get the errors."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowAuthorActions::SaveAsset),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
@@ -352,6 +363,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("pos_y"), TEXT("integer"), TEXT("Graph Y position (default 0)"))
 			.Optional(TEXT("properties"), TEXT("object"), TEXT("Property JSON to apply onto the new node"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("set_node_properties"),
@@ -362,6 +374,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Guid of the node to edit"))
 			.Required(TEXT("properties"), TEXT("object"), TEXT("Property JSON to apply"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("remove_node"),
@@ -371,6 +384,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Guid of the node to remove"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("add_comment"),
@@ -384,6 +398,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("width"), TEXT("integer"), TEXT("Box width (default 400)"))
 			.Optional(TEXT("height"), TEXT("integer"), TEXT("Box height (default 200)"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("connect_pins"),
@@ -396,6 +411,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Required(TEXT("to_node_guid"), TEXT("string"), TEXT("Target node guid"))
 			.Optional(TEXT("to_pin"), TEXT("string"), TEXT("Target INPUT pin name (default \"In\")"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("disconnect_pins"),
@@ -406,6 +422,17 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
 			.Required(TEXT("pin_name"), TEXT("string"), TEXT("Pin whose links to break"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("apply_batch"),
+		TEXT("Several edits to one Flow Asset in one transaction - all of them apply or none does. `operations` is an array of objects, each with `op` (add_node, set_node_properties, remove_node, add_comment, connect_pins, disconnect_pins) and that action's own params minus asset_path. add_node takes an optional `alias`; later operations refer to the new node as \"$alias\" wherever a node guid goes. Every operation is validated before anything changes; a failure while applying undoes the whole batch. Errors carry `code` and `op_index` in the error data. Returns per-operation results, the alias -> guid map and every link the schema broke to make room."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowAuthorActions::ApplyBatch),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object or package path"))
+			.Required(TEXT("operations"), TEXT("array"), TEXT("Operations to apply in order, e.g. [{\"op\":\"add_node\",\"alias\":\"log\",\"node_class\":\"/Script/Flow.FlowNode_Log\"},{\"op\":\"connect_pins\",\"from_node_guid\":\"<start guid>\",\"from_pin\":\"Out\",\"to_node_guid\":\"$log\"}]"))
+			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the batch (default false)"))
+			.Optional(TEXT("dry_run"), TEXT("boolean"), TEXT("Apply, report the result, then undo - nothing is kept (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("auto_layout"),
@@ -439,7 +466,19 @@ FMonolithActionResult FMonolithFlowAuthorActions::CreateAsset(const TSharedPtr<F
 	int32 DotIdx;
 	if (PackagePath.FindChar(TEXT('.'), DotIdx))
 	{
+		const FString ObjectName = PackagePath.Mid(DotIdx + 1);
 		PackagePath.LeftInline(DotIdx);
+		if (ObjectName != FPackageName::GetShortName(PackagePath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s': the object name after the dot must repeat the package name (/Pkg/Name.Name)"), *AssetPath));
+		}
+	}
+	// Checked before the factory runs: AssetTools reports a bad path with a log error or a dialog instead of failing quietly.
+	FText Reason;
+	if (!FPackageName::IsValidLongPackageName(PackagePath, /*bIncludeReadOnlyRoots=*/false, &Reason))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path '%s': %s"), *AssetPath, *Reason.ToString()));
 	}
 	FString AssetName;
 	if (!PackagePath.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd)
@@ -460,6 +499,11 @@ FMonolithActionResult FMonolithFlowAuthorActions::CreateAsset(const TSharedPtr<F
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create Flow Asset at %s/%s"), *PackagePath, *AssetName));
 	}
+	// Flow 2.3 initializes the editing policies (preload, pin connection) only
+	// when a graph is loaded, not when the factory creates one; a SubGraph node
+	// added to the fresh asset then hits a check on the missing preload policy.
+	// Flow 2.4 does it in CreateGraph; calling it again is harmless.
+	FA->SetupForEditing();
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
@@ -535,416 +579,671 @@ FMonolithActionResult FMonolithFlowAuthorActions::ValidateAsset(const TSharedPtr
 }
 
 // ============================================================================
-// Node authoring
+// Graph edits
+//
+// Every edit action - the single ones and apply_batch - goes through the same
+// path: each operation is validated up front without touching the asset, then
+// all of them are applied inside one transaction. Any failure while applying
+// undoes the whole transaction; dry_run applies, reports and undoes. Errors
+// carry a stable `code` (and `op_index` in a batch) in the error data.
 // ============================================================================
 
-FMonolithActionResult FMonolithFlowAuthorActions::AddNode(const TSharedPtr<FJsonObject>& Params)
+namespace
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
-
-	FString ClassPath;
-	if (!Params->TryGetStringField(TEXT("node_class"), ClassPath) || ClassPath.IsEmpty())
+	FMonolithActionResult Fail(const FEditError& Error, const TCHAR* RollbackState = nullptr)
 	{
-		return FMonolithActionResult::Error(TEXT("node_class is required"));
-	}
-	UClass* NodeClass = ResolveFlowNodeClass(ClassPath, Err);
-	if (!NodeClass) return FMonolithActionResult::Error(Err);
-
-	UEdGraph* Graph = FA->GetGraph();
-	if (!Graph)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("%s has no editor graph"), *FA->GetPathName()));
-	}
-
-	double PosX = 0, PosY = 0;
-	Params->TryGetNumberField(TEXT("pos_x"), PosX);
-	Params->TryGetNumberField(TEXT("pos_y"), PosY);
-
-	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
-	const bool bHasProps = Params->TryGetObjectField(TEXT("properties"), PropsObj) && PropsObj && PropsObj->IsValid();
-	if (bHasProps && !ValidatePropertyKeys(NodeClass, *PropsObj, Err))
-	{
-		return FMonolithActionResult::Error(Err);
+		TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+		Data->SetStringField(TEXT("code"), Error.Code);
+		if (Error.OpIndex != INDEX_NONE)
+		{
+			Data->SetNumberField(TEXT("op_index"), Error.OpIndex);
+		}
+		if (RollbackState)
+		{
+			Data->SetStringField(TEXT("rollback"), RollbackState);
+		}
+		FString Message = Error.OpIndex != INDEX_NONE
+			? FString::Printf(TEXT("Operation %d: %s"), Error.OpIndex, *Error.Message)
+			: Error.Message;
+		if (RollbackState && FCString::Strcmp(RollbackState, TEXT("done")) == 0)
+		{
+			Message += TEXT(" - the graph was left unchanged");
+		}
+		else if (RollbackState)
+		{
+			Message += TEXT(" - the change could NOT be rolled back, check the graph (editor Undo may revert it)");
+		}
+		return FMonolithActionResult::Error(Message).WithErrorData(Data);
 	}
 
-	UFlowNode* Node = nullptr;
-	const FUndoMark UndoMark;
-	bool bRollBack = false;
+	/** State shared by the operations of one edit run. */
+	struct FEditRun
 	{
-		const FScopedTransaction Transaction(LOCTEXT("AddFlowNode", "Monolith: Add Flow Node"));
-		FA->Modify();
+		UFlowAsset* Asset = nullptr;
+		/** Alias (without the leading $) -> key of the node created under it. */
+		TMap<FString, FGuid> Aliases;
+		/** Links the schema broke to make room for new ones. */
+		TArray<TSharedPtr<FJsonValue>> BrokenLinks;
+	};
+
+	/** What validation knows before anything is applied. */
+	struct FEditPlan
+	{
+		UFlowAsset* Asset = nullptr;
+		/** Alias -> class of the node it will create. */
+		TMap<FString, UClass*> AliasClasses;
+		/** Existing nodes removed by an earlier operation of the same run. */
+		TSet<FGuid> Removed;
+	};
+
+	bool IsAliasRef(const FString& Ref)
+	{
+		return Ref.StartsWith(TEXT("$"));
+	}
+
+	/** Node reference: "<guid>" or "$alias". Validation-time: resolves to the node's class. */
+	UClass* PlanNodeRef(const FEditPlan& Plan, const FString& Ref, FEditError& Out)
+	{
+		if (Ref.IsEmpty())
+		{
+			Out = { TEXT("invalid_params"), TEXT("node reference is empty") };
+			return nullptr;
+		}
+		if (IsAliasRef(Ref))
+		{
+			if (UClass* const* Cls = Plan.AliasClasses.Find(Ref.Mid(1)))
+			{
+				return *Cls;
+			}
+			Out = { TEXT("unknown_alias"), FString::Printf(TEXT("%s is not created by an earlier operation"), *Ref) };
+			return nullptr;
+		}
+		FGuid Guid;
+		if (!FGuid::Parse(Ref, Guid))
+		{
+			Out = { TEXT("invalid_params"), FString::Printf(TEXT("Invalid node guid: %s"), *Ref) };
+			return nullptr;
+		}
+		UFlowNode* Node = Plan.Asset->GetNodes().FindRef(Guid);
+		if (!Node || Plan.Removed.Contains(Guid))
+		{
+			Out = { TEXT("node_not_found"), FString::Printf(TEXT("Node %s not found in %s"), *Ref, *Plan.Asset->GetPathName()) };
+			return nullptr;
+		}
+		return Node->GetClass();
+	}
+
+	/** Node reference at apply time. */
+	UFlowNode* ResolveNodeRef(const FEditRun& Run, const FString& Ref, FEditError& Out)
+	{
+		FGuid Guid;
+		if (IsAliasRef(Ref))
+		{
+			if (const FGuid* Key = Run.Aliases.Find(Ref.Mid(1)))
+			{
+				Guid = *Key;
+			}
+		}
+		else
+		{
+			FGuid::Parse(Ref, Guid);
+		}
+		UFlowNode* Node = Guid.IsValid() ? Run.Asset->GetNodes().FindRef(Guid) : nullptr;
+		if (!Node)
+		{
+			Out = { TEXT("node_not_found"), FString::Printf(TEXT("Node %s not found in %s"), *Ref, *Run.Asset->GetPathName()) };
+		}
+		return Node;
+	}
+
+	UFlowGraphNode* GraphNodeOrError(UFlowNode* Node, FEditError& Out)
+	{
+		FString Err;
+		UFlowGraphNode* GraphNode = GraphNodeOf(Node, Err);
+		if (!GraphNode)
+		{
+			Out = { TEXT("no_editor_graph"), Err };
+		}
+		return GraphNode;
+	}
+
+	FString StringField(const TSharedPtr<FJsonObject>& Op, const TCHAR* Field)
+	{
+		FString Value;
+		Op->TryGetStringField(Field, Value);
+		return Value;
+	}
+
+	bool Require(const TSharedPtr<FJsonObject>& Op, std::initializer_list<const TCHAR*> Fields, FEditError& Out)
+	{
+		TArray<FString> Missing;
+		for (const TCHAR* Field : Fields)
+		{
+			if (!Op->HasField(Field))
+			{
+				Missing.Add(Field);
+			}
+		}
+		if (Missing.Num() > 0)
+		{
+			Out = { TEXT("invalid_params"), FString::Printf(TEXT("Missing: %s"), *FString::Join(Missing, TEXT(", "))) };
+			return false;
+		}
+		return true;
+	}
+
+	const TSharedPtr<FJsonObject>* PropertiesOf(const TSharedPtr<FJsonObject>& Op)
+	{
+		const TSharedPtr<FJsonObject>* Props = nullptr;
+		return Op->TryGetObjectField(TEXT("properties"), Props) && Props && Props->IsValid() ? Props : nullptr;
+	}
+
+	// --- add_node -----------------------------------------------------------
+
+	bool PlanAddNode(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
+	{
+		if (!Require(Op, { TEXT("node_class") }, Out)) return false;
+		FString Err;
+		UClass* NodeClass = ResolveFlowNodeClass(StringField(Op, TEXT("node_class")), Err);
+		if (!NodeClass)
+		{
+			Out = { TEXT("class_not_found"), Err };
+			return false;
+		}
+		if (const TSharedPtr<FJsonObject>* Props = PropertiesOf(Op))
+		{
+			if (!ValidatePropertyKeys(NodeClass, *Props, Out)) return false;
+		}
+		const FString Alias = StringField(Op, TEXT("alias"));
+		if (!Alias.IsEmpty())
+		{
+			if (Plan.AliasClasses.Contains(Alias))
+			{
+				Out = { TEXT("duplicate_alias"), FString::Printf(TEXT("Alias %s is used twice"), *Alias) };
+				return false;
+			}
+			Plan.AliasClasses.Add(Alias, NodeClass);
+		}
+		return true;
+	}
+
+	bool ApplyAddNode(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		FString Err;
+		UClass* NodeClass = ResolveFlowNodeClass(StringField(Op, TEXT("node_class")), Err);
+		double PosX = 0, PosY = 0;
+		Op->TryGetNumberField(TEXT("pos_x"), PosX);
+		Op->TryGetNumberField(TEXT("pos_y"), PosY);
+
+		UEdGraph* Graph = Run.Asset->GetGraph();
+		if (!Graph)
+		{
+			Out = { TEXT("no_editor_graph"), FString::Printf(TEXT("%s has no editor graph"), *Run.Asset->GetPathName()) };
+			return false;
+		}
 		Graph->Modify();
-
 		UFlowGraphNode* GraphNode = FFlowGraphSchemaAction_NewNode::CreateNode(
 			Graph, /*FromPin=*/nullptr, NodeClass,
 			FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)), /*bSelectNewNode=*/false);
-		Node = GraphNode ? Cast<UFlowNode>(GraphNode->GetFlowNodeBase()) : nullptr;
-		if (!GraphNode)
+		UFlowNode* Node = GraphNode ? Cast<UFlowNode>(GraphNode->GetFlowNodeBase()) : nullptr;
+		if (!Node)
 		{
-			Err = FString::Printf(TEXT("Schema refused to create node of class %s"), *ClassPath);
-			bRollBack = true;
+			Out = { TEXT("node_create_failed"), FString::Printf(TEXT("Schema refused to create a node of class %s"), *NodeClass->GetPathName()) };
+			return false;
 		}
-		else if (!Node)
+		if (const TSharedPtr<FJsonObject>* Props = PropertiesOf(Op))
 		{
-			Err = TEXT("Created graph node has no runtime UFlowNode");
-			bRollBack = true;
-		}
-		else if (bHasProps)
-		{
-			if (ApplyPropertiesJson(Node, *PropsObj, Err))
-			{
-				// Rebuild pins so context-pin nodes reflect the fresh property state.
-				GraphNode->ReconstructNode();
-			}
-			else
-			{
-				bRollBack = true;
-			}
+			if (!ApplyPropertiesJson(Node, *Props, Out)) return false;
+			// Rebuild pins so context-pin nodes reflect the fresh property state.
+			GraphNode->ReconstructNode();
 		}
 
-		if (!bRollBack)
+		const FString Alias = StringField(Op, TEXT("alias"));
+		if (!Alias.IsEmpty())
 		{
-			FA->MarkPackageDirty();
+			Run.Aliases.Add(Alias, MonolithFlow::NodeKeyOf(Node));
+			Result->SetStringField(TEXT("alias"), Alias);
 		}
-	}
-	if (bRollBack)
-	{
-		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(Err));
-	}
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("node_guid"), GuidStrOf(Node));
-	Result->SetStringField(TEXT("node_class"), Node->GetClass()->GetPathName());
-	{
+		Result->SetStringField(TEXT("node_guid"), GuidStrOf(Node));
+		Result->SetStringField(TEXT("node_class"), Node->GetClass()->GetPathName());
 		TArray<TSharedPtr<FJsonValue>> InPins, OutPins;
 		for (const FFlowPin& Pin : Node->GetInputPins())  InPins.Add(MakeShared<FJsonValueString>(Pin.PinName.ToString()));
 		for (const FFlowPin& Pin : Node->GetOutputPins()) OutPins.Add(MakeShared<FJsonValueString>(Pin.PinName.ToString()));
 		Result->SetArrayField(TEXT("input_pins"), InPins);
 		Result->SetArrayField(TEXT("output_pins"), OutPins);
+		return true;
 	}
-	if (!MaybeSave(Params, FA, Result))
+
+	// --- set_node_properties ------------------------------------------------
+
+	bool PlanSetProperties(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Node added but failed to save %s"), *FA->GetPathName()));
+		if (!Require(Op, { TEXT("node_guid"), TEXT("properties") }, Out)) return false;
+		UClass* NodeClass = PlanNodeRef(Plan, StringField(Op, TEXT("node_guid")), Out);
+		if (!NodeClass) return false;
+		const TSharedPtr<FJsonObject>* Props = PropertiesOf(Op);
+		if (!Props)
+		{
+			Out = { TEXT("invalid_params"), TEXT("properties must be an object") };
+			return false;
+		}
+		return ValidatePropertyKeys(NodeClass, *Props, Out);
 	}
-	return FMonolithActionResult::Success(Result);
+
+	bool ApplySetProperties(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		UFlowNode* Node = ResolveNodeRef(Run, StringField(Op, TEXT("node_guid")), Out);
+		UFlowGraphNode* GraphNode = Node ? GraphNodeOrError(Node, Out) : nullptr;
+		if (!GraphNode) return false;
+		const TSharedPtr<FJsonObject>* Props = PropertiesOf(Op);
+		if (!ApplyPropertiesJson(Node, *Props, Out)) return false;
+		GraphNode->ReconstructNode();
+		Result->SetStringField(TEXT("node_guid"), GuidStrOf(Node));
+		Result->SetNumberField(TEXT("applied_properties"), (*Props)->Values.Num());
+		return true;
+	}
+
+	// --- remove_node --------------------------------------------------------
+
+	bool PlanRemoveNode(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
+	{
+		if (!Require(Op, { TEXT("node_guid") }, Out)) return false;
+		const FString Ref = StringField(Op, TEXT("node_guid"));
+		if (!PlanNodeRef(Plan, Ref, Out)) return false;
+		FGuid Guid;
+		if (IsAliasRef(Ref))
+		{
+			Plan.AliasClasses.Remove(Ref.Mid(1));
+		}
+		else if (FGuid::Parse(Ref, Guid))
+		{
+			// Same rule as the editor's Delete key: Start and other nodes that opt out stay.
+			const UFlowNode* Node = Plan.Asset->GetNodes().FindRef(Guid);
+			const UEdGraphNode* GraphNode = Node ? Node->GetGraphNode() : nullptr;
+			if (GraphNode && !GraphNode->CanUserDeleteNode())
+			{
+				Out = { TEXT("node_not_deletable"), FString::Printf(TEXT("%s (%s) cannot be deleted - the editor does not allow it either"),
+					*Ref, *Node->GetClass()->GetName()) };
+				return false;
+			}
+			Plan.Removed.Add(Guid);
+		}
+		return true;
+	}
+
+	bool ApplyRemoveNode(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		UFlowNode* Node = ResolveNodeRef(Run, StringField(Op, TEXT("node_guid")), Out);
+		UFlowGraphNode* GraphNode = Node ? GraphNodeOrError(Node, Out) : nullptr;
+		if (!GraphNode) return false;
+		UEdGraph* Graph = GraphNode->GetGraph();
+		const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
+		if (!Schema)
+		{
+			Out = { TEXT("no_editor_graph"), TEXT("Graph schema not available") };
+			return false;
+		}
+
+		const FGuid Key = MonolithFlow::NodeKeyOf(Node);
+		Graph->Modify();
+		GraphNode->Modify();
+		Schema->BreakNodeLinks(*GraphNode);
+		GraphNode->DestroyNode();
+		// DestroyNode only removes the editor wrapper - the runtime node must be
+		// unregistered explicitly, mirroring SFlowGraphEditor::DeleteSelectedNodes.
+		Run.Asset->UnregisterNode(Key);
+
+		Result->SetStringField(TEXT("removed_node_guid"), Key.ToString(EGuidFormats::DigitsWithHyphens));
+		return true;
+	}
+
+	// --- add_comment --------------------------------------------------------
+
+	bool PlanAddComment(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
+	{
+		return Require(Op, { TEXT("text") }, Out);
+	}
+
+	bool ApplyAddComment(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		UEdGraph* Graph = Run.Asset->GetGraph();
+		if (!Graph)
+		{
+			Out = { TEXT("no_editor_graph"), FString::Printf(TEXT("%s has no editor graph"), *Run.Asset->GetPathName()) };
+			return false;
+		}
+		double PosX = 0, PosY = 0, Width = 400, Height = 200;
+		Op->TryGetNumberField(TEXT("pos_x"), PosX);
+		Op->TryGetNumberField(TEXT("pos_y"), PosY);
+		Op->TryGetNumberField(TEXT("width"), Width);
+		Op->TryGetNumberField(TEXT("height"), Height);
+
+		Graph->Modify();
+		UEdGraphNode_Comment* Comment = NewObject<UEdGraphNode_Comment>(Graph, NAME_None, RF_Transactional);
+		Comment->NodeComment = StringField(Op, TEXT("text"));
+		Comment->NodePosX = static_cast<int32>(PosX);
+		Comment->NodePosY = static_cast<int32>(PosY);
+		Comment->NodeWidth = static_cast<int32>(Width);
+		Comment->NodeHeight = static_cast<int32>(Height);
+		Comment->CreateNewGuid();
+		Graph->AddNode(Comment, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+
+		Result->SetStringField(TEXT("comment_guid"), Comment->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		return true;
+	}
+
+	// --- connect_pins -------------------------------------------------------
+
+	bool PlanConnect(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
+	{
+		if (!Require(Op, { TEXT("from_node_guid"), TEXT("from_pin"), TEXT("to_node_guid") }, Out)) return false;
+		return PlanNodeRef(Plan, StringField(Op, TEXT("from_node_guid")), Out)
+			&& PlanNodeRef(Plan, StringField(Op, TEXT("to_node_guid")), Out);
+	}
+
+	bool ApplyConnect(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		const FString FromPinName = StringField(Op, TEXT("from_pin"));
+		FString ToPinName = StringField(Op, TEXT("to_pin"));
+		if (ToPinName.IsEmpty()) ToPinName = TEXT("In");
+
+		UFlowNode* FromNode = ResolveNodeRef(Run, StringField(Op, TEXT("from_node_guid")), Out);
+		UFlowNode* ToNode = FromNode ? ResolveNodeRef(Run, StringField(Op, TEXT("to_node_guid")), Out) : nullptr;
+		UFlowGraphNode* FromGraphNode = ToNode ? GraphNodeOrError(FromNode, Out) : nullptr;
+		UFlowGraphNode* ToGraphNode = FromGraphNode ? GraphNodeOrError(ToNode, Out) : nullptr;
+		if (!ToGraphNode) return false;
+
+		UEdGraphPin* FromPin = FromGraphNode->FindPin(FName(*FromPinName), EGPD_Output);
+		UEdGraphPin* ToPin = ToGraphNode->FindPin(FName(*ToPinName), EGPD_Input);
+		if (!FromPin || !ToPin)
+		{
+			Out = { TEXT("pin_not_found"), !FromPin
+				? FString::Printf(TEXT("Output pin '%s' not found on node %s"), *FromPinName, *GuidStrOf(FromNode))
+				: FString::Printf(TEXT("Input pin '%s' not found on node %s"), *ToPinName, *GuidStrOf(ToNode)) };
+			return false;
+		}
+		const UEdGraphSchema* Schema = FromGraphNode->GetSchema();
+		const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
+		if (Response.Response == CONNECT_RESPONSE_DISALLOW)
+		{
+			Out = { TEXT("connection_refused"), FString::Printf(TEXT("Schema refused %s -> %s: %s"),
+				*DescribePin(FromPin), *DescribePin(ToPin), *Response.Message.ToString()) };
+			return false;
+		}
+
+		// The schema may break existing links to make room (an exec output drives one
+		// input, a data input reads one output) - exactly as a wire dragged in the
+		// editor does. Remember them so the answer says what was replaced.
+		TArray<TPair<UEdGraphPin*, UEdGraphPin*>> LinksBefore;
+		for (UEdGraphPin* Linked : FromPin->LinkedTo) LinksBefore.Emplace(FromPin, Linked);
+		for (UEdGraphPin* Linked : ToPin->LinkedTo)   LinksBefore.Emplace(Linked, ToPin);
+
+		FromGraphNode->Modify();
+		ToGraphNode->Modify();
+		if (!Schema->TryCreateConnection(FromPin, ToPin))
+		{
+			Out = { TEXT("connection_refused"), FString::Printf(TEXT("Schema failed to connect %s -> %s"), *DescribePin(FromPin), *DescribePin(ToPin)) };
+			return false;
+		}
+
+		TArray<TSharedPtr<FJsonValue>> Broken;
+		for (const TPair<UEdGraphPin*, UEdGraphPin*>& Link : LinksBefore)
+		{
+			if (!Link.Key->LinkedTo.Contains(Link.Value))
+			{
+				const TSharedPtr<FJsonValue> Value = MakeShared<FJsonValueString>(
+					FString::Printf(TEXT("%s -> %s"), *DescribePin(Link.Key), *DescribePin(Link.Value)));
+				Broken.Add(Value);
+				Run.BrokenLinks.Add(Value);
+			}
+		}
+		Result->SetStringField(TEXT("from"), DescribePin(FromPin));
+		Result->SetStringField(TEXT("to"), DescribePin(ToPin));
+		Result->SetArrayField(TEXT("broken_links"), Broken);
+		return true;
+	}
+
+	// --- disconnect_pins ----------------------------------------------------
+
+	bool PlanDisconnect(FEditPlan& Plan, const TSharedPtr<FJsonObject>& Op, FEditError& Out)
+	{
+		if (!Require(Op, { TEXT("node_guid"), TEXT("pin_name") }, Out)) return false;
+		return PlanNodeRef(Plan, StringField(Op, TEXT("node_guid")), Out) != nullptr;
+	}
+
+	bool ApplyDisconnect(FEditRun& Run, const TSharedPtr<FJsonObject>& Op, TSharedPtr<FJsonObject>& Result, FEditError& Out)
+	{
+		UFlowNode* Node = ResolveNodeRef(Run, StringField(Op, TEXT("node_guid")), Out);
+		UFlowGraphNode* GraphNode = Node ? GraphNodeOrError(Node, Out) : nullptr;
+		if (!GraphNode) return false;
+		const FString PinName = StringField(Op, TEXT("pin_name"));
+		UEdGraphPin* Pin = GraphNode->FindPin(FName(*PinName));
+		if (!Pin)
+		{
+			Out = { TEXT("pin_not_found"), FString::Printf(TEXT("Pin '%s' not found on node %s"), *PinName, *GuidStrOf(Node)) };
+			return false;
+		}
+		const int32 LinkCount = Pin->LinkedTo.Num();
+		GraphNode->Modify();
+		GraphNode->GetSchema()->BreakPinLinks(*Pin, /*bSendsNodeNotification=*/true);
+		Result->SetStringField(TEXT("pin"), DescribePin(Pin));
+		Result->SetNumberField(TEXT("links_broken"), LinkCount);
+		return true;
+	}
+
+	// --- runner -------------------------------------------------------------
+
+	struct FEditOp
+	{
+		const TCHAR* Name;
+		bool (*Plan)(FEditPlan&, const TSharedPtr<FJsonObject>&, FEditError&);
+		bool (*Apply)(FEditRun&, const TSharedPtr<FJsonObject>&, TSharedPtr<FJsonObject>&, FEditError&);
+	};
+
+	const FEditOp GEditOps[] =
+	{
+		{ TEXT("add_node"),            &PlanAddNode,       &ApplyAddNode },
+		{ TEXT("set_node_properties"), &PlanSetProperties, &ApplySetProperties },
+		{ TEXT("remove_node"),         &PlanRemoveNode,    &ApplyRemoveNode },
+		{ TEXT("add_comment"),         &PlanAddComment,    &ApplyAddComment },
+		{ TEXT("connect_pins"),        &PlanConnect,       &ApplyConnect },
+		{ TEXT("disconnect_pins"),     &PlanDisconnect,    &ApplyDisconnect },
+	};
+
+	const FEditOp* FindEditOp(const FString& Name)
+	{
+		for (const FEditOp& Op : GEditOps)
+		{
+			if (Name == Op.Name) return &Op;
+		}
+		return nullptr;
+	}
+
+	FString EditOpNames()
+	{
+		TArray<FString> Names;
+		for (const FEditOp& Op : GEditOps) Names.Add(Op.Name);
+		return FString::Join(Names, TEXT(", "));
+	}
+
+	/**
+	 * Validate, then apply a list of operations to one asset in one transaction.
+	 * bBatch shapes the answer: a batch reports per-operation results, a single
+	 * action answers with its one operation's fields at the top level.
+	 */
+	FMonolithActionResult RunEdit(const TSharedPtr<FJsonObject>& Params, const TArray<TPair<const FEditOp*, TSharedPtr<FJsonObject>>>& Ops,
+		const FText& TransactionTitle, bool bBatch)
+	{
+		FString Err;
+		UFlowAsset* FlowAsset = LoadFlowAssetParam(Params, Err);
+		if (!FlowAsset)
+		{
+			return Fail({ Params.IsValid() && Params->HasField(TEXT("asset_path")) ? TEXT("asset_not_found") : TEXT("invalid_params"), Err });
+		}
+
+		bool bDryRun = false;
+		Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+		FEditPlan Plan;
+		Plan.Asset = FlowAsset;
+		for (int32 Index = 0; Index < Ops.Num(); ++Index)
+		{
+			FEditError Error;
+			if (!Ops[Index].Key->Plan(Plan, Ops[Index].Value, Error))
+			{
+				Error.OpIndex = bBatch ? Index : INDEX_NONE;
+				return Fail(Error);
+			}
+		}
+
+		FEditRun Run;
+		Run.Asset = FlowAsset;
+		TArray<TSharedPtr<FJsonValue>> OpResults;
+		FEditError Error;
+		const FUndoMark UndoMark;
+		{
+			const FScopedTransaction Transaction(TransactionTitle);
+			FlowAsset->Modify();
+			for (int32 Index = 0; Index < Ops.Num(); ++Index)
+			{
+				TSharedPtr<FJsonObject> OpResult = MakeShared<FJsonObject>();
+				OpResult->SetStringField(TEXT("op"), Ops[Index].Key->Name);
+				if (!Ops[Index].Key->Apply(Run, Ops[Index].Value, OpResult, Error))
+				{
+					Error.OpIndex = bBatch ? Index : INDEX_NONE;
+					break;
+				}
+				OpResults.Add(MakeShared<FJsonValueObject>(OpResult));
+			}
+			if (Error.Code.IsEmpty())
+			{
+				FlowAsset->HarvestNodeConnections();
+				if (!bDryRun)
+				{
+					FlowAsset->MarkPackageDirty();
+				}
+			}
+		}
+
+		if (!Error.Code.IsEmpty())
+		{
+			return Fail(Error, UndoMark.RollBack() ? TEXT("done") : TEXT("failed"));
+		}
+
+		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+		if (bBatch)
+		{
+			Result->SetArrayField(TEXT("results"), OpResults);
+			TSharedRef<FJsonObject> Aliases = MakeShared<FJsonObject>();
+			for (const TPair<FString, FGuid>& Pair : Run.Aliases)
+			{
+				Aliases->SetStringField(Pair.Key, Pair.Value.ToString(EGuidFormats::DigitsWithHyphens));
+			}
+			Result->SetObjectField(TEXT("aliases"), Aliases);
+			Result->SetArrayField(TEXT("broken_links"), Run.BrokenLinks);
+		}
+		else if (OpResults.Num() == 1)
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : OpResults[0]->AsObject()->Values)
+			{
+				if (Field.Key != TEXT("op")) Result->SetField(Field.Key, Field.Value);
+			}
+		}
+		Result->SetStringField(TEXT("asset_path"), FlowAsset->GetPathName());
+		Result->SetNumberField(TEXT("node_count"), FlowAsset->GetNodes().Num());
+
+		if (bDryRun)
+		{
+			// Everything above describes the graph as the edit left it; now put it back.
+			const bool bRolledBack = UndoMark.RollBack();
+			Result->SetBoolField(TEXT("dry_run"), true);
+			Result->SetBoolField(TEXT("rolled_back"), bRolledBack);
+			if (!bRolledBack)
+			{
+				return Fail({ TEXT("rollback_failed"), TEXT("Dry run applied but could not be undone") }, TEXT("failed"));
+			}
+			return FMonolithActionResult::Success(Result);
+		}
+
+		if (!MaybeSave(Params, FlowAsset, Result))
+		{
+			return Fail({ TEXT("save_failed"), FString::Printf(TEXT("Edit applied but failed to save %s"), *FlowAsset->GetPathName()) });
+		}
+		return FMonolithActionResult::Success(Result);
+	}
+
+	/** A single edit action: its params are one operation. */
+	FMonolithActionResult RunSingle(const TCHAR* OpName, const TSharedPtr<FJsonObject>& Params, const FText& Title)
+	{
+		if (!Params.IsValid())
+		{
+			return Fail({ TEXT("invalid_params"), TEXT("params are required") });
+		}
+		TArray<TPair<const FEditOp*, TSharedPtr<FJsonObject>>> Ops;
+		Ops.Emplace(FindEditOp(OpName), Params);
+		return RunEdit(Params, Ops, Title, /*bBatch=*/false);
+	}
+}
+
+FMonolithActionResult FMonolithFlowAuthorActions::AddNode(const TSharedPtr<FJsonObject>& Params)
+{
+	return RunSingle(TEXT("add_node"), Params, LOCTEXT("AddFlowNode", "Monolith: Add Flow Node"));
 }
 
 FMonolithActionResult FMonolithFlowAuthorActions::SetNodeProperties(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
-
-	FString NodeGuid;
-	if (!Params->TryGetStringField(TEXT("node_guid"), NodeGuid) || NodeGuid.IsEmpty())
-	{
-		return FMonolithActionResult::Error(TEXT("node_guid is required"));
-	}
-	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
-	if (!Params->TryGetObjectField(TEXT("properties"), PropsObj) || !PropsObj || !PropsObj->IsValid())
-	{
-		return FMonolithActionResult::Error(TEXT("properties object is required"));
-	}
-
-	UFlowNode* Node = FindRuntimeNode(FA, NodeGuid, Err);
-	if (!Node) return FMonolithActionResult::Error(Err);
-	UFlowGraphNode* GraphNode = GraphNodeOf(Node, Err);
-	if (!GraphNode) return FMonolithActionResult::Error(Err);
-
-	if (!ValidatePropertyKeys(Node->GetClass(), *PropsObj, Err))
-	{
-		return FMonolithActionResult::Error(Err);
-	}
-
-	const FUndoMark UndoMark;
-	bool bRollBack = false;
-	{
-		const FScopedTransaction Transaction(LOCTEXT("SetFlowNodeProperties", "Monolith: Set Flow Node Properties"));
-		FA->Modify();
-
-		if (ApplyPropertiesJson(Node, *PropsObj, Err))
-		{
-			GraphNode->ReconstructNode();
-			FA->HarvestNodeConnections();
-			FA->MarkPackageDirty();
-		}
-		else
-		{
-			bRollBack = true;
-		}
-	}
-	if (bRollBack)
-	{
-		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(Err));
-	}
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("node_guid"), GuidStrOf(Node));
-	Result->SetNumberField(TEXT("applied_properties"), (*PropsObj)->Values.Num());
-	if (!MaybeSave(Params, FA, Result))
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Properties applied but failed to save %s"), *FA->GetPathName()));
-	}
-	return FMonolithActionResult::Success(Result);
+	return RunSingle(TEXT("set_node_properties"), Params, LOCTEXT("SetFlowNodeProperties", "Monolith: Set Flow Node Properties"));
 }
 
 FMonolithActionResult FMonolithFlowAuthorActions::RemoveNode(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
-
-	FString NodeGuid;
-	if (!Params->TryGetStringField(TEXT("node_guid"), NodeGuid) || NodeGuid.IsEmpty())
-	{
-		return FMonolithActionResult::Error(TEXT("node_guid is required"));
-	}
-	UFlowNode* Node = FindRuntimeNode(FA, NodeGuid, Err);
-	if (!Node) return FMonolithActionResult::Error(Err);
-	UFlowGraphNode* GraphNode = GraphNodeOf(Node, Err);
-	if (!GraphNode) return FMonolithActionResult::Error(Err);
-
-	UEdGraph* Graph = GraphNode->GetGraph();
-	const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
-	if (!Schema)
-	{
-		return FMonolithActionResult::Error(TEXT("Graph schema not available"));
-	}
-
-	const FScopedTransaction Transaction(LOCTEXT("RemoveFlowNode", "Monolith: Remove Flow Node"));
-	FA->Modify();
-	Graph->Modify();
-	GraphNode->Modify();
-
-	const FGuid RuntimeGuid = MonolithFlow::NodeKeyOf(Node);
-	Schema->BreakNodeLinks(*GraphNode);
-	GraphNode->DestroyNode();
-	// DestroyNode only removes the editor wrapper - the runtime node must be
-	// unregistered explicitly, mirroring SFlowGraphEditor::DeleteSelectedNodes.
-	FA->UnregisterNode(RuntimeGuid);
-	FA->HarvestNodeConnections();
-	FA->MarkPackageDirty();
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("removed_node_guid"), NodeGuid);
-	Result->SetNumberField(TEXT("node_count"), FA->GetNodes().Num());
-	if (!MaybeSave(Params, FA, Result))
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Node removed but failed to save %s"), *FA->GetPathName()));
-	}
-	return FMonolithActionResult::Success(Result);
+	return RunSingle(TEXT("remove_node"), Params, LOCTEXT("RemoveFlowNode", "Monolith: Remove Flow Node"));
 }
 
 FMonolithActionResult FMonolithFlowAuthorActions::AddComment(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
-
-	FString Text;
-	if (!Params->TryGetStringField(TEXT("text"), Text))
-	{
-		return FMonolithActionResult::Error(TEXT("text is required"));
-	}
-	UEdGraph* Graph = FA->GetGraph();
-	if (!Graph)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("%s has no editor graph"), *FA->GetPathName()));
-	}
-
-	double PosX = 0, PosY = 0, Width = 400, Height = 200;
-	Params->TryGetNumberField(TEXT("pos_x"), PosX);
-	Params->TryGetNumberField(TEXT("pos_y"), PosY);
-	Params->TryGetNumberField(TEXT("width"), Width);
-	Params->TryGetNumberField(TEXT("height"), Height);
-
-	const FScopedTransaction Transaction(LOCTEXT("AddFlowComment", "Monolith: Add Flow Graph Comment"));
-	Graph->Modify();
-
-	UEdGraphNode_Comment* Comment = NewObject<UEdGraphNode_Comment>(Graph, NAME_None, RF_Transactional);
-	Comment->NodeComment = Text;
-	Comment->NodePosX = static_cast<int32>(PosX);
-	Comment->NodePosY = static_cast<int32>(PosY);
-	Comment->NodeWidth = static_cast<int32>(Width);
-	Comment->NodeHeight = static_cast<int32>(Height);
-	Comment->CreateNewGuid();
-	Graph->AddNode(Comment, /*bUserAction=*/false, /*bSelectNewNode=*/false);
-	FA->MarkPackageDirty();
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("comment_guid"), Comment->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	if (!MaybeSave(Params, FA, Result))
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Comment added but failed to save %s"), *FA->GetPathName()));
-	}
-	return FMonolithActionResult::Success(Result);
+	return RunSingle(TEXT("add_comment"), Params, LOCTEXT("AddFlowComment", "Monolith: Add Flow Graph Comment"));
 }
-
-// ============================================================================
-// Wiring
-// ============================================================================
 
 FMonolithActionResult FMonolithFlowAuthorActions::ConnectPins(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
-
-	FString FromGuid, FromPinName, ToGuid, ToPinName;
-	Params->TryGetStringField(TEXT("from_node_guid"), FromGuid);
-	Params->TryGetStringField(TEXT("from_pin"), FromPinName);
-	Params->TryGetStringField(TEXT("to_node_guid"), ToGuid);
-	Params->TryGetStringField(TEXT("to_pin"), ToPinName);
-	if (FromGuid.IsEmpty() || FromPinName.IsEmpty() || ToGuid.IsEmpty())
-	{
-		return FMonolithActionResult::Error(TEXT("from_node_guid, from_pin and to_node_guid are required"));
-	}
-	if (ToPinName.IsEmpty()) ToPinName = TEXT("In");
-
-	UFlowNode* FromNode = FindRuntimeNode(FA, FromGuid, Err);
-	if (!FromNode) return FMonolithActionResult::Error(Err);
-	UFlowNode* ToNode = FindRuntimeNode(FA, ToGuid, Err);
-	if (!ToNode) return FMonolithActionResult::Error(Err);
-
-	UFlowGraphNode* FromGraphNode = GraphNodeOf(FromNode, Err);
-	if (!FromGraphNode) return FMonolithActionResult::Error(Err);
-	UFlowGraphNode* ToGraphNode = GraphNodeOf(ToNode, Err);
-	if (!ToGraphNode) return FMonolithActionResult::Error(Err);
-
-	UEdGraphPin* FromPin = FromGraphNode->FindPin(FName(*FromPinName), EGPD_Output);
-	if (!FromPin)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Output pin '%s' not found on node %s"), *FromPinName, *FromGuid));
-	}
-	UEdGraphPin* ToPin = ToGraphNode->FindPin(FName(*ToPinName), EGPD_Input);
-	if (!ToPin)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Input pin '%s' not found on node %s"), *ToPinName, *ToGuid));
-	}
-
-	UEdGraph* Graph = FromGraphNode->GetGraph();
-	const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
-	if (!Schema)
-	{
-		return FMonolithActionResult::Error(TEXT("Graph schema not available"));
-	}
-
-	// The schema may break existing links to make room (an exec output drives one
-	// input, a data input reads one output) - exactly as a wire dragged in the
-	// editor does. Remember them so the answer says what was replaced.
-	TArray<TPair<UEdGraphPin*, UEdGraphPin*>> LinksBefore;
-	for (UEdGraphPin* Linked : FromPin->LinkedTo) LinksBefore.Emplace(FromPin, Linked);
-	for (UEdGraphPin* Linked : ToPin->LinkedTo)   LinksBefore.Emplace(Linked, ToPin);
-
-	const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
-	if (Response.Response == CONNECT_RESPONSE_DISALLOW)
-	{
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Schema refused connection %s.%s -> %s.%s: %s"),
-			*FromGuid, *FromPinName, *ToGuid, *ToPinName, *Response.Message.ToString()));
-	}
-
-	const FUndoMark UndoMark;
-	bool bConnected = false;
-	{
-		const FScopedTransaction Transaction(LOCTEXT("ConnectFlowPins", "Monolith: Connect Flow Pins"));
-		FA->Modify();
-		FromGraphNode->Modify();
-		ToGraphNode->Modify();
-
-		bConnected = Schema->TryCreateConnection(FromPin, ToPin);
-		if (bConnected)
-		{
-			FA->HarvestNodeConnections();
-			FA->MarkPackageDirty();
-		}
-	}
-	if (!bConnected)
-	{
-		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(FString::Printf(
-			TEXT("Schema failed to connect %s.%s -> %s.%s"),
-			*FromGuid, *FromPinName, *ToGuid, *ToPinName)));
-	}
-
-	TArray<TSharedPtr<FJsonValue>> BrokenLinks;
-	for (const TPair<UEdGraphPin*, UEdGraphPin*>& Link : LinksBefore)
-	{
-		if (!Link.Key->LinkedTo.Contains(Link.Value))
-		{
-			BrokenLinks.Add(MakeShared<FJsonValueString>(
-				FString::Printf(TEXT("%s -> %s"), *DescribePin(Link.Key), *DescribePin(Link.Value))));
-		}
-	}
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("from"), FString::Printf(TEXT("%s.%s"), *FromGuid, *FromPinName));
-	Result->SetStringField(TEXT("to"), FString::Printf(TEXT("%s.%s"), *ToGuid, *ToPinName));
-	Result->SetArrayField(TEXT("broken_links"), BrokenLinks);
-	if (!MaybeSave(Params, FA, Result))
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Connected but failed to save %s"), *FA->GetPathName()));
-	}
-	return FMonolithActionResult::Success(Result);
+	return RunSingle(TEXT("connect_pins"), Params, LOCTEXT("ConnectFlowPins", "Monolith: Connect Flow Pins"));
 }
 
 FMonolithActionResult FMonolithFlowAuthorActions::DisconnectPins(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Err;
-	UFlowAsset* FA = LoadFlowAssetParam(Params, Err);
-	if (!FA) return FMonolithActionResult::Error(Err);
+	return RunSingle(TEXT("disconnect_pins"), Params, LOCTEXT("DisconnectFlowPins", "Monolith: Disconnect Flow Pins"));
+}
 
-	FString NodeGuid, PinName;
-	Params->TryGetStringField(TEXT("node_guid"), NodeGuid);
-	Params->TryGetStringField(TEXT("pin_name"), PinName);
-	if (NodeGuid.IsEmpty() || PinName.IsEmpty())
+FMonolithActionResult FMonolithFlowAuthorActions::ApplyBatch(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* OpValues = nullptr;
+	if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("operations"), OpValues) || OpValues->Num() == 0)
 	{
-		return FMonolithActionResult::Error(TEXT("node_guid and pin_name are required"));
+		return Fail({ TEXT("invalid_params"), TEXT("operations must be a non-empty array") });
 	}
 
-	UFlowNode* Node = FindRuntimeNode(FA, NodeGuid, Err);
-	if (!Node) return FMonolithActionResult::Error(Err);
-	UFlowGraphNode* GraphNode = GraphNodeOf(Node, Err);
-	if (!GraphNode) return FMonolithActionResult::Error(Err);
-
-	UEdGraphPin* Pin = GraphNode->FindPin(FName(*PinName));
-	if (!Pin)
+	TArray<TPair<const FEditOp*, TSharedPtr<FJsonObject>>> Ops;
+	for (int32 Index = 0; Index < OpValues->Num(); ++Index)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Pin '%s' not found on node %s"), *PinName, *NodeGuid));
+		const TSharedPtr<FJsonObject>* OpObject = nullptr;
+		FString OpName;
+		if (!(*OpValues)[Index]->TryGetObject(OpObject) || !(*OpObject)->TryGetStringField(TEXT("op"), OpName))
+		{
+			FEditError Error{ TEXT("invalid_params"), TEXT("each operation must be an object with an `op` field") };
+			Error.OpIndex = Index;
+			return Fail(Error);
+		}
+		const FEditOp* Op = FindEditOp(OpName);
+		if (!Op)
+		{
+			FEditError Error{ TEXT("unknown_op"), FString::Printf(TEXT("Unknown op '%s' (expected one of: %s)"), *OpName, *EditOpNames()) };
+			Error.OpIndex = Index;
+			return Fail(Error);
+		}
+		Ops.Emplace(Op, *OpObject);
 	}
-
-	UEdGraph* Graph = GraphNode->GetGraph();
-	const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
-	if (!Schema)
-	{
-		return FMonolithActionResult::Error(TEXT("Graph schema not available"));
-	}
-
-	const int32 LinkCount = Pin->LinkedTo.Num();
-
-	const FScopedTransaction Transaction(LOCTEXT("DisconnectFlowPins", "Monolith: Disconnect Flow Pins"));
-	FA->Modify();
-	GraphNode->Modify();
-
-	Schema->BreakPinLinks(*Pin, /*bSendsNodeNotification=*/true);
-	FA->HarvestNodeConnections();
-	FA->MarkPackageDirty();
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
-	Result->SetStringField(TEXT("pin"), FString::Printf(TEXT("%s.%s"), *NodeGuid, *PinName));
-	Result->SetNumberField(TEXT("links_broken"), LinkCount);
-	if (!MaybeSave(Params, FA, Result))
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Disconnected but failed to save %s"), *FA->GetPathName()));
-	}
-	return FMonolithActionResult::Success(Result);
+	return RunEdit(Params, Ops, LOCTEXT("ApplyFlowBatch", "Monolith: Edit Flow Graph"), /*bBatch=*/true);
 }
 
 // ============================================================================
@@ -1011,24 +1310,66 @@ namespace
 		const int32 N = G.Nodes.Num();
 		if (N == 0) return 0;
 
-		// Longest-path layering via bounded relaxation (cycle-safe: N passes max).
-		TArray<int32> Layer;
-		Layer.Init(0, N);
-		for (int32 Pass = 0; Pass < N; ++Pass)
+		// Loops (retry, wait-until) would make longest-path layering climb forever,
+		// so drop back edges first: a DFS from the entry nodes (no predecessors),
+		// then from anything left, marks every edge into a node still on the stack.
+		TArray<TSet<int32>> Forward;
+		Forward.SetNum(N);
 		{
-			bool bChanged = false;
-			for (int32 i = 0; i < N; ++i)
+			TArray<uint8> State;   // 0 unvisited, 1 on stack, 2 done
+			State.Init(0, N);
+			auto Visit = [&](int32 Root)
 			{
-				for (int32 Succ : G.Out[i])
+				TArray<TPair<int32, int32>> Stack;   // node, next successor index
+				Stack.Emplace(Root, 0);
+				State[Root] = 1;
+				while (Stack.Num() > 0)
 				{
-					if (Layer[Succ] < Layer[i] + 1 && Layer[Succ] < N)
+					TPair<int32, int32>& Top = Stack.Last();
+					const int32 Node = Top.Key;
+					if (Top.Value < G.Out[Node].Num())
 					{
-						Layer[Succ] = Layer[i] + 1;
-						bChanged = true;
+						const int32 Succ = G.Out[Node][Top.Value++];
+						if (State[Succ] == 1)
+						{
+							continue;   // back edge
+						}
+						Forward[Node].Add(Succ);
+						if (State[Succ] == 0)
+						{
+							State[Succ] = 1;
+							Stack.Emplace(Succ, 0);
+						}
+					}
+					else
+					{
+						State[Node] = 2;
+						Stack.Pop();
 					}
 				}
+			};
+			for (int32 i = 0; i < N; ++i) if (State[i] == 0 && G.In[i].Num() == 0) Visit(i);
+			for (int32 i = 0; i < N; ++i) if (State[i] == 0) Visit(i);
+		}
+
+		// Longest-path layering over the acyclic rest, in topological order.
+		TArray<int32> Layer;
+		Layer.Init(0, N);
+		{
+			TArray<int32> Pending;
+			Pending.Init(0, N);
+			for (int32 i = 0; i < N; ++i) for (int32 Succ : Forward[i]) ++Pending[Succ];
+			TArray<int32> Ready;
+			for (int32 i = 0; i < N; ++i) if (Pending[i] == 0) Ready.Add(i);
+			while (Ready.Num() > 0)
+			{
+				const int32 Node = Ready.Pop(EAllowShrinking::No);
+				for (int32 Succ : Forward[Node])
+				{
+					Layer[Succ] = FMath::Max(Layer[Succ], Layer[Node] + 1);
+					if (--Pending[Succ] == 0) Ready.Add(Succ);
+				}
 			}
-			if (!bChanged) break;
 		}
 
 		// Bucket by layer, initial order = current Y (keeps manual grouping stable-ish).
@@ -1194,6 +1535,15 @@ FMonolithActionResult FMonolithFlowAuthorActions::AutoLayout(const TSharedPtr<FJ
 	Params->TryGetNumberField(TEXT("horizontal_spacing"), HSpacing);
 	Params->TryGetNumberField(TEXT("vertical_spacing"), VSpacing);
 
+	if (Formatter != TEXT("monolith") && Formatter != TEXT("blueprint_assist") && Formatter != TEXT("auto"))
+	{
+		return Fail({ TEXT("invalid_params"), FString::Printf(TEXT("Unknown formatter '%s' (monolith | blueprint_assist | auto)"), *Formatter) });
+	}
+	if (LayoutMode != TEXT("all") && LayoutMode != TEXT("new_only") && LayoutMode != TEXT("selected"))
+	{
+		return Fail({ TEXT("invalid_params"), FString::Printf(TEXT("Unknown layout_mode '%s' (all | new_only | selected)"), *LayoutMode) });
+	}
+
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
 
@@ -1248,7 +1598,9 @@ FMonolithActionResult FMonolithFlowAuthorActions::AutoLayout(const TSharedPtr<FJ
 			{
 				if (UFlowGraphNode* FlowNode = Cast<UFlowGraphNode>(EdNode))
 				{
-					if (FlowNode->NodePosX == 0 && FlowNode->NodePosY == 0)
+					// Nodes the graph was created with (Start - the editor will not delete
+					// them) sit at the origin by design and anchor the rest.
+					if (FlowNode->NodePosX == 0 && FlowNode->NodePosY == 0 && FlowNode->CanUserDeleteNode())
 					{
 						Targets.Add(FlowNode);
 					}

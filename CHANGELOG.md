@@ -1,6 +1,37 @@
 # Changelog
 
-## [0.17.0] - Unreleased
+## [0.18.0] - 2026-11-04
+
+Builds and passes its automation tests on UE 5.7 + Flow 2.3, UE 5.8 + Flow 2.3 and UE 5.8 + the Flow 2.4 development line.
+
+### Added
+
+- **`apply_batch`**: several edits to one Flow Asset in one transaction, all or nothing. `operations` is a list of `add_node`, `set_node_properties`, `remove_node`, `add_comment`, `connect_pins`, `disconnect_pins` with their usual params; `add_node` takes an `alias`, and later operations refer to the new node as `"$alias"`. Every operation is checked before anything changes, a failure while applying undoes the whole batch, one editor Undo reverts it.
+- **`dry_run`** on every graph edit and on `apply_batch`: the edit is applied, reported (new guids, broken links, per-operation results) and undone. Nothing is kept, the package is not dirtied.
+- **Error codes.** A failed edit carries `code` in the error data (and `op_index` in a batch): `invalid_params`, `asset_not_found`, `no_editor_graph`, `unknown_op`, `unknown_alias`, `duplicate_alias`, `node_not_found`, `node_not_deletable`, `class_not_found`, `node_create_failed`, `unknown_property`, `read_only_property`, `wrong_type`, `pin_not_found`, `connection_refused`, `apply_failed`, `save_failed`, `rollback_failed`. An agent can fix and retry without parsing the message.
+- **`get_node_history`** and the `flow_node_history` table: when a re-index finds that a node lost properties (a UPROPERTY removed or renamed in C++), the previous snapshot is kept, last 5 per node, with the names of the lost properties and the time it was taken. Setting *Keep Property History*, on by default.
+- `flow_assets.indexed_at`: when each graph was last indexed, so a snapshot read from `flow_nodes.data` has a date.
+- **Data-pin links** are indexed as edges with `kind = 'data'`, producer output to consumer input. `walk_execution` follows execution edges only.
+- `runtime_get_instance` reports `activation_state` of every active and recorded node, takes an `owner` filter, and refuses to pick silently when several root instances run from one template: the error lists their owners.
+- `diff_assets` reports `shared_node_count`, and a `note` when the two assets share no node guids - the case of a graph duplicated in the editor, which Flow gives new guids.
+- Automation tests: 54 tests under `MonolithFlow.*` (indexer, reconcile, reads, analysis, authoring, batch and dry run, layout, validation, PIE runtime without PIE, registered surface). They build fixtures in memory and index into a temporary SQLite file, so they never touch project content or the project index. See *Running the tests* in the README.
+
+### Fixed
+
+- Data-pin links were indexed backwards, as orphaned output edges from the consumer, plus a fake `Exec` output pin named after the input.
+- `is_orphaned` of connections was never written (the INSERT bound 5 of 6 values), so every edge read as current.
+- `find_nodes_by_property` with `property_name` matched the value of any later property of the same node.
+- Glob filters treated `_` and `%` in the pattern as SQL wildcards: `/Game/A_B*` also matched `/Game/AxB`.
+- Read actions did not find a node given a lower-case or braced guid, which authoring accepts. Guid params are normalized everywhere, and enum params (`kind`, `pin_direction`, `source`, `layout_mode`, `formatter`) reject unknown values instead of returning nothing.
+- The property snapshot carried the path of the node's editor wrapper, so two copies of one node never compared equal.
+- Instanced object properties were rejected by `set_node_properties` in the inline shape the snapshot itself uses.
+- `remove_node` deleted the Start node, which the editor does not allow (`node_not_deletable`).
+- `auto_layout`: one loop in the graph stretched the layout to as many layers as the graph has nodes; `new_only` moved the Start node, which the factory places at the origin; an unknown `formatter` silently fell back to the built-in one.
+- `create_asset` on Flow 2.3: a SubGraph node added to the fresh asset crashed the editor on the missing preload policy. Bad paths (no leading slash, trailing slash, unknown mount point, object name not repeating the package name, invalid characters) are now refused before the factory runs.
+- `walk_execution`: a native subclass of `FlowNode_Start` or `FlowNode_CustomInput` is an entry point; a node whose only edge points at a node missing from the graph is a terminal; the order of `reached` and `unreachable` is stable.
+- During a full index pass, a graph whose old id has gone to another graph no longer loses its rows before its own turn: they are parked under a negative id, so its previous property snapshot is still there to compare against. Reconciliation drops whatever is still parked when the pass ends.
+
+## [0.17.0] - 2026-11-04
 
 First public release as a standalone repository.
 

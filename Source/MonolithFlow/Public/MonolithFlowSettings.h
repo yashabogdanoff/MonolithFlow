@@ -30,4 +30,12 @@ public:
 	/** Index Flow assets (UFlowAsset, UFlowNodeBlueprint, UFlowNodeAddOnBlueprint) into Monolith's project index. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing", DisplayName="Index Flow Assets")
 	bool bIndexFlow = true;
+
+	/**
+	 * When re-indexing finds a node whose property snapshot lost properties (typically a
+	 * UPROPERTY removed or renamed in C++), keep the previous snapshot in flow_node_history
+	 * (last 5 per node) so the values can still be recovered with flow.get_node_history.
+	 */
+	UPROPERTY(config, EditAnywhere, Category="Indexing", DisplayName="Keep Property History")
+	bool bKeepPropertyHistory = true;
 };

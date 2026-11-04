@@ -22,9 +22,20 @@
 
 namespace
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Set by FScopedSubsystemOverride. */
+	UFlowSubsystem* GSubsystemOverride = nullptr;
+#endif
+
 	/** Resolve the PIE-world Flow subsystem (handles project-level UFlowSubsystem overrides). */
 	UFlowSubsystem* GetPieFlowSubsystem(FString& OutError)
 	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (GSubsystemOverride)
+		{
+			return GSubsystemOverride;
+		}
+#endif
 		if (!GEditor || !GEditor->PlayWorld)
 		{
 			OutError = TEXT("No PIE session running - start PIE first (editor.start_pie)");
@@ -72,7 +83,29 @@ namespace
 #if WITH_EDITOR
 		Row->SetStringField(TEXT("display_name"), Node->GetNodeTitle().ToString());
 #endif
+		Row->SetStringField(TEXT("activation_state"),
+			StaticEnum<EFlowNodeState>()->GetNameStringByValue(static_cast<int64>(Node->GetActivationState())));
 		return MakeShared<FJsonValueObject>(Row);
+	}
+
+	/** True when the owner filter names the instance owner or the actor owning it. */
+	bool OwnerMatches(const UObject* Owner, const FString& Filter)
+	{
+		if (Filter.IsEmpty())
+		{
+			return true;
+		}
+		if (!Owner)
+		{
+			return false;
+		}
+		if (Owner->GetName() == Filter || Owner->GetPathName() == Filter)
+		{
+			return true;
+		}
+		const UFlowComponent* Component = Cast<UFlowComponent>(Owner);
+		const AActor* OwnerActor = Component ? Component->GetOwner() : nullptr;
+		return OwnerActor && (OwnerActor->GetName() == Filter || OwnerActor->GetActorNameOrLabel() == Filter);
 	}
 
 	/** Template asset path of an instanced Flow asset (falls back to instance path). */
@@ -86,6 +119,19 @@ namespace
 	}
 }
 
+#if WITH_DEV_AUTOMATION_TESTS
+FMonolithFlowRuntimeActions::FScopedSubsystemOverride::FScopedSubsystemOverride(UFlowSubsystem* Subsystem)
+	: Previous(GSubsystemOverride)
+{
+	GSubsystemOverride = Subsystem;
+}
+
+FMonolithFlowRuntimeActions::FScopedSubsystemOverride::~FScopedSubsystemOverride()
+{
+	GSubsystemOverride = Previous;
+}
+#endif
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -98,11 +144,12 @@ void FMonolithFlowRuntimeActions::RegisterActions(FMonolithToolRegistry& Registr
 		FParamSchemaBuilder().Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("runtime_get_instance"),
-		TEXT("Deep-dive one running Flow instance matched by its TEMPLATE asset path: currently active nodes and the recorded activation history (most recent last, tail limited by history_limit). Requires PIE."),
+		TEXT("Deep-dive one running Flow instance matched by its TEMPLATE asset path: currently active nodes and the recorded activation history (most recent last, tail limited by history_limit), each node with its activation_state. When several root instances run from one template, pass owner to pick one; without it the call fails and lists the owners. Requires PIE."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowRuntimeActions::RuntimeGetInstance),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("TEMPLATE UFlowAsset object path (as authored, not the PIE instance name)"))
-			.Optional(TEXT("history_limit"), TEXT("integer"), TEXT("Max recorded nodes returned, most recent last (default 30)"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("TEMPLATE UFlowAsset object path (as authored, not the PIE instance name) or package path"))
+			.Optional(TEXT("owner"), TEXT("string"), TEXT("Name of the instance owner or of the actor owning its Flow component, as runtime_list_instances reports them"))
+			.Optional(TEXT("history_limit"), TEXT("integer"), TEXT("Max recorded nodes returned, most recent last (default 30, at least 1)"))
 			.Build());
 }
 
@@ -151,26 +198,37 @@ FMonolithActionResult FMonolithFlowRuntimeActions::RuntimeGetInstance(const TSha
 	}
 	double HistoryLimit = 30;
 	Params->TryGetNumberField(TEXT("history_limit"), HistoryLimit);
+	FString OwnerFilter;
+	Params->TryGetStringField(TEXT("owner"), OwnerFilter);
 
 	// Match by template path; also accept package-path-only form ("/Game/X/FLOW_Y").
 	const UFlowAsset* Match = nullptr;
 	const UObject* MatchOwner = nullptr;
+	TArray<FString> MatchOwners;
 	for (const TPair<UObject*, UFlowAsset*>& Pair : FlowSubsystem->GetRootInstances())
 	{
 		const UFlowAsset* Instance = Pair.Value;
 		if (!Instance) continue;
 		const FString TemplatePath = TemplatePathOf(Instance);
-		if (TemplatePath == AssetPath || TemplatePath.StartsWith(AssetPath + TEXT(".")))
+		if ((TemplatePath == AssetPath || TemplatePath.StartsWith(AssetPath + TEXT("."))) && OwnerMatches(Pair.Key, OwnerFilter))
 		{
 			Match = Instance;
 			MatchOwner = Pair.Key;
-			break;
+			MatchOwners.Add(Pair.Key ? Pair.Key->GetName() : FString(TEXT("<none>")));
 		}
 	}
 	if (!Match)
 	{
+		return FMonolithActionResult::Error(OwnerFilter.IsEmpty()
+			? FString::Printf(TEXT("No running root Flow instance for template '%s' (see runtime_list_instances)"), *AssetPath)
+			: FString::Printf(TEXT("No running root Flow instance for template '%s' owned by '%s' (see runtime_list_instances)"), *AssetPath, *OwnerFilter));
+	}
+	if (MatchOwners.Num() > 1)
+	{
+		MatchOwners.Sort();
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("No running root Flow instance for template '%s' (see runtime_list_instances)"), *AssetPath));
+			TEXT("%d root Flow instances run from template '%s'; pass owner to pick one of: %s"),
+			MatchOwners.Num(), *AssetPath, *FString::Join(MatchOwners, TEXT(", "))));
 	}
 
 	auto Result = MakeShared<FJsonObject>();

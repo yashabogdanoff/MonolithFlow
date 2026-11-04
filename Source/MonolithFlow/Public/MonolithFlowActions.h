@@ -69,6 +69,21 @@ public:
 
 	/** Structural diff of two Flow Assets: nodes only-in-A/B, changed node data, added/removed edges. */
 	static FMonolithActionResult DiffAssets(const TSharedPtr<FJsonObject>& Params);
+
+	/** Earlier property snapshots kept when a re-index lost properties of a node. */
+	static FMonolithActionResult GetNodeHistory(const TSharedPtr<FJsonObject>& Params);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Routes the read actions to another index database while alive, so automation tests never touch the project index. */
+	struct FScopedDatabaseOverride
+	{
+		explicit FScopedDatabaseOverride(class FSQLiteDatabase* Database);
+		~FScopedDatabaseOverride();
+
+	private:
+		class FSQLiteDatabase* Previous = nullptr;
+	};
+#endif
 };
 
 #endif // WITH_FLOW

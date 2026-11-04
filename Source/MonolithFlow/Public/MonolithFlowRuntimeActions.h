@@ -23,6 +23,18 @@ public:
 
 	/** One instance's active nodes + recorded activation history. */
 	static FMonolithActionResult RuntimeGetInstance(const TSharedPtr<FJsonObject>& Params);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Serves the runtime actions from another Flow subsystem while alive, so automation tests need no PIE session. */
+	struct FScopedSubsystemOverride
+	{
+		explicit FScopedSubsystemOverride(class UFlowSubsystem* Subsystem);
+		~FScopedSubsystemOverride();
+
+	private:
+		class UFlowSubsystem* Previous = nullptr;
+	};
+#endif
 };
 
 #endif // WITH_FLOW

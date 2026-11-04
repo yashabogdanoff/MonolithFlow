@@ -55,6 +55,9 @@ public:
 	/** Break all links of one pin (schema-mediated, then re-harvest runtime connections). */
 	static FMonolithActionResult DisconnectPins(const TSharedPtr<FJsonObject>& Params);
 
+	/** Several edits to one asset in one transaction: all apply or none; nodes created in the batch are referenced by alias. */
+	static FMonolithActionResult ApplyBatch(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Layout ---
 
 	/** Auto-layout the graph: layered left-to-right by execution flow (or Blueprint Assist when available). */

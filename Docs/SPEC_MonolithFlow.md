@@ -1,8 +1,8 @@
 # MonolithFlow - Sibling Plugin Spec
 
 **Host:** [Monolith](https://github.com/tumourlove/monolith) (hard plugin dependency; see its `Docs/SIBLING_PLUGIN_GUIDE.md`)
-**Engine:** Unreal Engine 5.7, 5.8 | **Flow:** 2.3 | **Monolith:** 0.24.0+
-**Version:** 0.17.0 (Beta)
+**Engine:** Unreal Engine 5.7, 5.8 | **Flow:** 2.3 (the 2.4 development line builds and passes the tests on 5.8) | **Monolith:** 0.24.0+
+**Version:** 0.18.0 (Beta)
 **Status:** **Standalone sibling plugin** (`Plugins/MonolithFlow/`, beside `Plugins/Monolith/`). Registers into `FMonolithToolRegistry` and `UMonolithIndexSubsystem` through Monolith's exported public API - no Monolith sources are modified. Successor of the retired in-tree fork branch `feature/flow-graph-handler` (0.14.x), which predated Monolith's sibling-plugin support.
 
 ---
@@ -10,7 +10,7 @@
 ## MonolithFlow
 
 **Dependencies:** Core, CoreUObject, Engine, DeveloperSettings, DataValidation, EditorScriptingUtilities, AssetTools, Flow, FlowEditor, MonolithCore, MonolithIndex, SQLiteCore, UnrealEd, BlueprintGraph, Kismet, EditorSubsystem, Json, JsonUtilities, GameplayTags, AssetRegistry
-**Namespace:** `flow` | **Tool:** `flow_query(action, params)` | **Actions:** 29 - reads (index-backed, `FMonolithFlowActions`), authoring (live asset via FlowEditor graph API, `FMonolithFlowAuthorActions`), PIE runtime (`FMonolithFlowRuntimeActions`)
+**Namespace:** `flow` | **Tool:** `flow_query(action, params)` | **Actions:** 31 - reads (index-backed, `FMonolithFlowActions`), authoring (live asset via FlowEditor graph API, `FMonolithFlowAuthorActions`), PIE runtime (`FMonolithFlowRuntimeActions`)
 **Conditional:** MothCocoon Flow plugin features wrapped in `#if WITH_FLOW` (all three translation units, headers included). When Flow is absent, the module compiles to an empty stub (0 actions registered). Build.cs looks for `Flow.uplugin` under the project's whole `Plugins` tree (so `Plugins/FlowGraph` from a GitHub clone and nested layouts are found), under the engine's `Plugins/Marketplace` (Fab obfuscates folder names) and at `Engine/Plugins/Flow`; the walk stops at the first directory that holds any `.uplugin`, so it never descends into plugin content. Matching is on the descriptor file name - folder-name globs would false-positive on neighbours like `FlowValidation/`. The found path, or the stub notice, goes to the build log. `MONOLITH_RELEASE_BUILD=1` forces stub mode.
 **Settings:** own `UMonolithFlowSettings` (UDeveloperSettings, Project Settings → Plugins → Monolith Flow, persisted to `DefaultMonolith.ini`): `bEnableFlow` (Modules) + `bIndexFlow` (Indexing), both default True. A sibling cannot inject UPROPERTYs into the host's `UMonolithSettings` - this replaces the fork-era toggles that lived there.
 
@@ -22,18 +22,23 @@ MonolithFlow indexes the [MothCocoon Flow plugin](https://github.com/MothCocoon/
 |----------|---------|-------------|
 | Asset listing | 2 | `list_assets` (glob filter, `offset` / `limit` paging with `total` + `has_more`), `get_asset_info` (counts, class breakdown, sample nodes) |
 | Graph walk | 5 | `list_nodes`, `list_node_pins`, `list_connections`, `list_addons`, `get_node_info` |
-| Graph analysis | 3 | `walk_execution` (BFS from Start/CustomInput: depth, unreachable, terminals), `export_graph` (one-call whole-asset dump incl. positions + comments), `diff_assets` (nodes/edges structural diff by guid) |
+| Graph analysis | 3 | `walk_execution` (BFS over execution edges from Start/CustomInput and their subclasses: depth, unreachable, terminals), `export_graph` (one-call whole-asset dump incl. positions + comments), `diff_assets` (nodes/edges structural diff by guid, `shared_node_count`) |
+| Property history | 1 | `get_node_history` (snapshots kept in `flow_node_history` when a re-index found lost properties) |
 | Cross-asset reverse lookup | 5 | `list_custom_events`, `find_subgraph_callers`, `find_node_class_usages`, `find_pins_by_type`, `find_nodes_by_property` |
 | Class registry | 1 | `list_node_classes` (BP + native, with kind / source / glob filters) |
-| Authoring | 8 | `create_asset` (UFlowAssetFactory via IAssetTools), `add_node` (FFlowGraphSchemaAction_NewNode::CreateNode + property JSON + ReconstructNode), `set_node_properties`, `remove_node` (BreakNodeLinks + UFlowGraphNode::DestroyNode), `connect_pins` / `disconnect_pins` (UEdGraphSchema-mediated + HarvestNodeConnections), `add_comment`, `save_asset`. All wrapped in FScopedTransaction (editor undo). Optional `save` param on every mutation. |
+| Authoring | 9 | `create_asset` (UFlowAssetFactory via IAssetTools, path checked with `FPackageName::IsValidLongPackageName` first), `add_node` (FFlowGraphSchemaAction_NewNode::CreateNode + property JSON + ReconstructNode), `set_node_properties`, `remove_node` (BreakNodeLinks + UFlowGraphNode::DestroyNode; refuses nodes the editor cannot delete), `connect_pins` / `disconnect_pins` (UEdGraphSchema-mediated + HarvestNodeConnections), `add_comment`, `apply_batch` (several of the above in one transaction, with aliases), `save_asset`. Edits run in one FScopedTransaction each (editor undo), take `dry_run` and an optional `save`. |
 | Layout | 1 | `auto_layout` - built-in layered formatter (bounded longest-path layering + 2 barycenter sweeps; cycle-safe) with `all` / `new_only` / `selected` modes, or Blueprint Assist through `IMonolithGraphFormatter` when available |
 | Validation | 1 | `validate_asset` - `UEditorValidatorSubsystem::IsObjectValid` (covers node `ValidateNode()` and project validator plugins) |
-| PIE runtime | 2 | `runtime_list_instances`, `runtime_get_instance` (`UFlowSubsystem::GetRootInstances`, ActiveNodes / RecordedNodes) |
+| PIE runtime | 2 | `runtime_list_instances`, `runtime_get_instance` (`UFlowSubsystem::GetRootInstances`, ActiveNodes / RecordedNodes with `GetActivationState()`; `owner` picks one of several instances of a template) |
 | Smoke | 1 | `ping` |
 
 ### Authoring semantics
 
 Reads answer from the index (stale until the asset is saved and the live indexer refreshes it); authoring actions mutate the LIVE asset through the same FlowEditor code paths as manual editing. After `connect_pins` / `disconnect_pins` / `set_node_properties` the runtime `Connections` map is re-synced via `UFlowAsset::HarvestNodeConnections()`. `add_node` rebuilds pins after applying the property JSON, so context-pin nodes (tag-driven switches etc.) come up with their generated pins. Property JSON shape = the `data` snapshot from `get_node_info` (same `FJsonObjectConverter` conventions both ways). Before any change the top-level keys are checked against the node class: unknown names, properties without `CPF_Edit` or with `CPF_EditConst`, and values whose JSON type does not fit the property (a struct given as a string must parse through `ImportText`) are rejected - `FJsonObjectConverter` itself turns such mismatches into default values and reports success. Each changed property gets `PreEditChange` / `PostEditChangeProperty(ValueSet)`. If a mutation still fails inside its transaction, the transaction is undone (`FScopedTransaction::Cancel` only drops the record), and only when it is the newest one opened since the call started. `connect_pins` returns `broken_links`, the links the Flow schema broke to make room.
+
+**One path for every edit.** The six graph edits and `apply_batch` share one runner. Each operation is first resolved and checked without touching the asset (node guids and `$alias` references, node classes, pin names and directions, property names, flags and JSON shapes); the first failure returns its error before anything changes. The operations are then applied in order inside one `FScopedTransaction`; a failure while applying undoes the transaction, so the batch is all or nothing and one editor Undo reverts a successful one. `dry_run` applies, builds the full answer and undoes, leaving the package's dirty flag as it was. Errors carry `code` (and `op_index` in a batch) in the error data: `invalid_params`, `asset_not_found`, `no_editor_graph`, `unknown_op`, `unknown_alias`, `duplicate_alias`, `node_not_found`, `node_not_deletable`, `class_not_found`, `node_create_failed`, `unknown_property`, `read_only_property`, `wrong_type`, `pin_not_found`, `connection_refused`, `apply_failed`, `save_failed`, `rollback_failed`.
+
+**Validation on save.** `save_asset` goes through `UEditorAssetLibrary::SaveLoadedAsset`. The engine's validate-on-save and Flow 2.4's (which runs only while the asset is open in a Flow editor tab) write their findings to the editor log and message log and never block the save, so `save_asset` reports `saved: true` for an invalid graph. `validate_asset` is the way to get the errors back.
 
 **Node identity** is the key of `UFlowAsset::Nodes`, not the node's own `NodeGuid`. They match on healthy assets; duplicated or imported nodes can share one `NodeGuid` under distinct keys, and Flow resolves nodes and connections (`GetNode`, `FConnectedPin`) by the key. The index, authoring and runtime actions all use the key; the indexer logs a warning per asset with mismatches.
 
@@ -43,7 +48,11 @@ Reads answer from the index (stale until the asset is saved and the live indexer
 
 `flow_nodes` gained `pos_x` / `pos_y` (editor-graph position, NULL when no editor wrapper); new table `flow_graph_comments` (fa_asset_id, comment_text, pos_x, pos_y, width, height, color) captures comment boxes. Both migrate via the ALTER-on-EnsureTablesExist pattern; a full reindex refreshes existing rows.
 
-### Database Schema (9 tables)
+### Index schema additions (0.18.0)
+
+`flow_assets.indexed_at` (UTC time of the last index of the graph); `flow_node_connections.kind` (`exec` or `data`); new table `flow_node_history`. **Data-pin links** are stored by Flow on the consumer side: the consumer's `Connections` map is keyed by its input pin and points at the producer's output. The indexer recognises such keys as input pins (runtime `InputPins` or input pins of the editor wrapper) and writes the edge forward, producer output to consumer input, with `kind = 'data'`; exec edges keep `kind = 'exec'`. `walk_execution` follows only `exec` edges, so a data link never makes a node reachable; `diff_assets` and `list_connections` see both kinds.
+
+### Database Schema (10 tables)
 
 | Table | Purpose | Cleanup key |
 |-------|---------|-------------|
@@ -56,6 +65,7 @@ Reads answer from the index (stale until the asset is saved and the live indexer
 | `flow_custom_events` | Custom Inputs / Custom Outputs of each Flow Asset (entry / exit names exposed to parent SubGraph nodes) | `fa_asset_id` |
 | `flow_graph_comments` | Comment boxes of the editor graph (text, position, size, color) | `fa_asset_id` |
 | `flow_node_classes` | Registry of every UFlowNode / UFlowNodeAddOn class referenced (BP + opportunistic native, `class_path` UNIQUE) | `class_path` (BP refresh) / `INSERT OR IGNORE` (native) |
+| `flow_node_history` | Previous `data` snapshots of nodes whose re-index lost properties (`removed_properties`, `indexed_at`), last 5 per node; keyed by path so it survives the id churn of a full pass | `fa_path` (follows renames, dropped with its graph) |
 
 ### Key Actions
 
@@ -82,5 +92,16 @@ Reads answer from the index (stale until the asset is saved and the live indexer
 > **`UFlowAssetParams` deferred.** The fourth Flow asset type is still experimental upstream and changes shape between minor versions. `flow_assets.base_params_path` carries `BaseAssetParams.AssetPtr.ToSoftObjectPath()` so callers can join, but the params asset itself isn't introspected.
 >
 > **Schema migration.** Schema additions (e.g. `is_orphaned` on `flow_node_pins` / `flow_node_connections` in 0.14.7) ship via `ALTER TABLE ADD COLUMN` inside `EnsureTablesExist`. The ALTER silently no-ops on fresh DBs where the column already exists, so existing project DBs upgrade without a forced full reindex.
+>
+> **Editor duplicates share no guids with their source.** `UFlowAsset::PostDuplicate` empties `Nodes` and `UFlowGraphNode::PostDuplicate` gives every node a new guid and registers it again, so a graph duplicated in the editor is internally consistent but has no node in common with the original. `diff_assets` matches by guid and reads such a pair as two different graphs; it reports `shared_node_count: 0` and a `note` saying so. Versions of one graph (a file copied on disk, another branch) keep their guids and diff node by node.
+
+### Automation tests
+
+`Private/Tests/`, test names `MonolithFlow.<Area>.<Case>` (Index, Reconcile, Snapshot, History, Read, Author, Batch, Layout, Runtime, Surface). Nothing touches the project:
+
+- **Fixtures in memory.** Flow assets are created in transient packages under `/Temp/MonolithFlowTests` with `UFlowGraph::CreateGraph` + `SetupForEditing`, nodes are added and wired through the Flow graph schema as the editor does, and assets are marked garbage afterwards. `create_asset` tests use a fresh `/Game/__MonolithFlowTests/<guid>` path, never save, and unregister the asset from the Asset Registry.
+- **Index in a temporary file.** `MonolithFlowTests::FTempIndex` opens a Monolith index database (Monolith's own schema) in the automation transient directory and deletes it afterwards. `FMonolithFlowActions::FScopedDatabaseOverride` points the read actions at it.
+- **Runtime without PIE.** A game world and a bare `UFlowSubsystem` are created by hand; `FMonolithFlowRuntimeActions::FScopedSubsystemOverride` points the runtime actions at that subsystem. The Flow debugger's `OnInstancedTemplateAdded/Removed` delegates are unbound for the test and restored after it.
+- Both seams exist only under `WITH_DEV_AUTOMATION_TESTS`.
 
 ---

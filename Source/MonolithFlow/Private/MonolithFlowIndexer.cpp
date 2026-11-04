@@ -3,6 +3,10 @@
 #if WITH_FLOW
 
 #include "MonolithIndexDatabase.h"
+#include "MonolithFlowSettings.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "FlowAsset.h"
 #include "Nodes/FlowNode.h"
 #include "Nodes/FlowNodeBase.h"
@@ -85,6 +89,25 @@ namespace
 		return Cls.IsNull() ? FString() : Cls.ToSoftObjectPath().ToString();
 	}
 
+	/** Top-level property names of a `data` snapshot (`graphNode` is not a property; older snapshots carried it). */
+	TSet<FString> TopLevelJsonKeys(const FString& Json)
+	{
+		TSet<FString> Keys;
+		TSharedPtr<FJsonObject> Object;
+		const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Json);
+		if (!Json.IsEmpty() && FJsonSerializer::Deserialize(Reader, Object) && Object.IsValid())
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Object->Values)
+			{
+				if (Pair.Key != TEXT("graphNode"))
+				{
+					Keys.Add(Pair.Key);
+				}
+			}
+		}
+		return Keys;
+	}
+
 	/** Run a parameterless statement and return how many rows it changed. */
 	int64 ExecCountingChanges(FSQLiteDatabase* RawDB, const TCHAR* Sql)
 	{
@@ -154,6 +177,8 @@ namespace
 	 * Skips: CPF_Transient, CPF_DuplicateTransient - design-time-only properties survive.
 	 * Skips: CPF_DisableEditOnInstance is intentionally NOT skipped (some Flow-internal
 	 * UPROPERTYs that drive runtime behaviour have it set).
+	 * Drops: `graphNode`, the path of the editor wrapper. It embeds the asset's own
+	 * path, so identical nodes of two assets would never compare equal.
 	 */
 	FString SerializeInstancePropertiesToJson(UObject* Instance)
 	{
@@ -161,18 +186,18 @@ namespace
 		const UClass* Cls = Instance->GetClass();
 		if (!Cls) return FString();
 
-		FString Out;
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 		const int64 SkipFlags = CPF_Transient | CPF_DuplicateTransient;
-		if (!FJsonObjectConverter::UStructToJsonObjectString(
-			Cls, Instance, Out,
-			/*CheckFlags=*/0,
-			/*SkipFlags=*/SkipFlags,
-			/*Indent=*/0,
-			/*ExportCb=*/nullptr,
-			/*bPrettyPrint=*/false))
+		if (!FJsonObjectConverter::UStructToJsonObject(Cls, Instance, Object, /*CheckFlags=*/0, /*SkipFlags=*/SkipFlags))
 		{
 			return FString();
 		}
+		Object->RemoveField(TEXT("graphNode"));
+
+		FString Out;
+		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
+		FJsonSerializer::Serialize(Object, Writer);
 		return Out;
 	}
 
@@ -206,7 +231,8 @@ namespace
 		const FString& FromPin,
 		const FString& ToNodeGuid,
 		const FString& ToPin,
-		bool bIsOrphaned = false)
+		bool bIsOrphaned = false,
+		const TCHAR* Kind = TEXT("exec"))
 	{
 		Stmt.Reset();
 		Stmt.ClearBindings();
@@ -216,6 +242,7 @@ namespace
 		Stmt.SetBindingValueByIndex(4, ToNodeGuid);
 		Stmt.SetBindingValueByIndex(5, ToPin);
 		Stmt.SetBindingValueByIndex(6, bIsOrphaned ? 1 : 0);
+		Stmt.SetBindingValueByIndex(7, FString(Kind));
 		Stmt.Execute();
 	}
 
@@ -592,6 +619,9 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_to ON flow_node_connections(to_node_guid)"));
 	// Migrate existing tables (silently no-ops on fresh DB).
 	RawDB->Execute(TEXT("ALTER TABLE flow_node_connections ADD COLUMN is_orphaned INTEGER NOT NULL DEFAULT 0"));
+	// exec: an execution edge, stored on the output pin. data: a data-pin link, which Flow
+	// stores on the input pin of the consumer; indexed source -> consumer like any other edge.
+	RawDB->Execute(TEXT("ALTER TABLE flow_node_connections ADD COLUMN kind TEXT NOT NULL DEFAULT 'exec'"));
 
 	RawDB->Execute(TEXT(
 		"CREATE TABLE IF NOT EXISTS flow_subgraph_refs ("
@@ -639,6 +669,25 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 	));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_classes_kind ON flow_node_classes(kind)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_classes_native ON flow_node_classes(is_native)"));
+
+	// When the snapshot was taken. NULL on rows written before the column existed.
+	RawDB->Execute(TEXT("ALTER TABLE flow_assets ADD COLUMN indexed_at TEXT"));
+
+	// Previous property snapshots of nodes whose re-index lost properties - the
+	// values a C++ refactor makes unreadable. Keyed by path, not asset id, so it
+	// survives the id churn of a full pass.
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_node_history ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  fa_path TEXT NOT NULL,"
+		"  node_guid TEXT NOT NULL,"
+		"  node_class TEXT NOT NULL,"
+		"  data TEXT,"
+		"  indexed_at TEXT,"
+		"  removed_properties TEXT NOT NULL"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_history_node ON flow_node_history(fa_path, node_guid)"));
 
 	bTablesCreated = true;
 }
@@ -712,18 +761,51 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 	const FString FaPath = FA->GetPathName();
 
+	// ----- Previous snapshots, read before cleanup wipes them -----
+	struct FPreviousSnapshot
+	{
+		FString NodeClass;
+		FString Data;
+		FString IndexedAt;
+	};
+	TMap<FString, FPreviousSnapshot> PreviousSnapshots;
+	const bool bKeepHistory = GetDefault<UMonolithFlowSettings>()->bKeepPropertyHistory;
+	if (bKeepHistory)
+	{
+		FSQLitePreparedStatement Stmt;
+		if (Stmt.Create(*RawDB, TEXT(
+			"SELECT n.node_guid, n.node_class, n.data, f.indexed_at FROM flow_nodes n"
+			" JOIN flow_assets f ON f.fa_asset_id = n.fa_asset_id WHERE f.fa_path = ?")))
+		{
+			Stmt.SetBindingValueByIndex(1, FaPath);
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				FString Guid;
+				FPreviousSnapshot Snapshot;
+				Stmt.GetColumnValueByIndex(0, Guid);
+				Stmt.GetColumnValueByIndex(1, Snapshot.NodeClass);
+				Stmt.GetColumnValueByIndex(2, Snapshot.Data);
+				Stmt.GetColumnValueByIndex(3, Snapshot.IndexedAt);
+				PreviousSnapshots.Add(Guid, MoveTemp(Snapshot));
+			}
+		}
+		Stmt.Destroy();
+	}
+
 	// ----- Cleanup of previous rows -----
 	// Child rows key on fa_asset_id alone, and a full pass resets Monolith's
 	// `assets` table, so ids are handed out again while flow_* still holds rows
 	// written under the old ones. The id this asset gets now may be the old id
 	// of a different graph. Order matters:
-	//   1. AssetId is ours from now on: drop every flow_assets row holding it
-	//      (a stale row of another graph, or our own) and all children under it.
-	//      That graph, if it still exists, gets a fresh row when its turn comes.
+	//   1. AssetId is ours from now on. A stale row of another graph holding it
+	//      is parked, with its children, under a negative id no asset can have:
+	//      that graph keeps its rows - and its previous property snapshot - until
+	//      its own turn comes, and reconciliation drops whatever is still parked
+	//      when the pass ends. Children left under AssetId are dropped.
 	//   2. Then drop our own previous row by path, and its children under the old
 	//      id. Nothing live can hold that id at this point: whichever graph took
-	//      it this pass already removed our row in its step 1.
-	// Deleting children by the old id first - the previous order - wiped the
+	//      it this pass already parked our row in its step 1.
+	// Deleting children by the old id first - the order before 0.17 - wiped the
 	// freshly written children of whichever graph had already taken that id.
 	auto DeleteChildrenOf = [RawDB](int64 FaAssetId)
 	{
@@ -736,6 +818,59 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), FaAssetId);
 	};
 
+	{
+		TArray<int64> OtherRows;
+		FSQLitePreparedStatement Stmt;
+		if (Stmt.Create(*RawDB, TEXT("SELECT id FROM flow_assets WHERE fa_asset_id = ? AND fa_path <> ?")))
+		{
+			Stmt.SetBindingValueByIndex(1, AssetId);
+			Stmt.SetBindingValueByIndex(2, FaPath);
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				int64 RowId = 0;
+				Stmt.GetColumnValueByIndex(0, RowId);
+				OtherRows.Add(RowId);
+			}
+		}
+		Stmt.Destroy();
+
+		if (OtherRows.Num() > 0)
+		{
+			const int64 Parking = -OtherRows[0];
+			static const TCHAR* ParkChildren[] =
+			{
+				TEXT("UPDATE flow_nodes SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+				TEXT("UPDATE flow_node_pins SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+				TEXT("UPDATE flow_node_addons SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+				TEXT("UPDATE flow_node_connections SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+				TEXT("UPDATE flow_subgraph_refs SET host_fa_asset_id = ? WHERE host_fa_asset_id = ?"),
+				TEXT("UPDATE flow_custom_events SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+				TEXT("UPDATE flow_graph_comments SET fa_asset_id = ? WHERE fa_asset_id = ?"),
+			};
+			for (const TCHAR* Sql : ParkChildren)
+			{
+				FSQLitePreparedStatement Park;
+				if (Park.Create(*RawDB, Sql))
+				{
+					Park.SetBindingValueByIndex(1, Parking);
+					Park.SetBindingValueByIndex(2, AssetId);
+					Park.Execute();
+				}
+				Park.Destroy();
+			}
+			for (const int64 RowId : OtherRows)
+			{
+				FSQLitePreparedStatement Park;
+				if (Park.Create(*RawDB, TEXT("UPDATE flow_assets SET fa_asset_id = ? WHERE id = ?")))
+				{
+					Park.SetBindingValueByIndex(1, Parking);
+					Park.SetBindingValueByIndex(2, RowId);
+					Park.Execute();
+				}
+				Park.Destroy();
+			}
+		}
+	}
 	DeleteChildrenOf(AssetId);
 	ExecWithInt64(RawDB, TEXT("DELETE FROM flow_assets WHERE fa_asset_id = ?"), AssetId);
 
@@ -761,9 +896,10 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		if (Stmt.Create(*RawDB, TEXT(
 			"INSERT INTO flow_assets ("
 			"fa_asset_id, fa_path, name, asset_class, asset_guid, expected_owner_class, world_bound, "
-			"base_params_path, node_count, addon_count, subgraph_count"
-			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)")))
+			"base_params_path, node_count, addon_count, subgraph_count, indexed_at"
+			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)")))
 		{
+			Stmt.SetBindingValueByIndex(9, FDateTime::UtcNow().ToIso8601());
 			Stmt.SetBindingValueByIndex(1, AssetId);
 			Stmt.SetBindingValueByIndex(2, FaPath);
 			Stmt.SetBindingValueByIndex(3, FA->GetName());
@@ -805,8 +941,8 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	FSQLitePreparedStatement ConnStmt;
 	const bool bConnStmtOk = ConnStmt.Create(*RawDB, TEXT(
 		"INSERT INTO flow_node_connections ("
-		"fa_asset_id, from_node_guid, from_pin, to_node_guid, to_pin"
-		") VALUES (?, ?, ?, ?, ?)"));
+		"fa_asset_id, from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned, kind"
+		") VALUES (?, ?, ?, ?, ?, ?, ?)"));
 
 	FSQLitePreparedStatement AddOnStmt;
 	const bool bAddOnStmtOk = AddOnStmt.Create(*RawDB, TEXT(
@@ -841,6 +977,7 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	}
 
 	int32 GuidMismatchCount = 0;
+	TMap<FString, FString> NewSnapshots;
 	for (const TPair<FGuid, UFlowNode*>& Pair : FA->GetNodes())
 	{
 		UFlowNode* Node = Pair.Value;
@@ -866,6 +1003,7 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		const TArray<FFlowPin>& OutPins = Node->GetOutputPins();
 
 		const FString DataJson = SerializeInstancePropertiesToJson(Node);
+		NewSnapshots.Add(NodeGuidStr, DataJson);
 
 		// Opportunistic native node-class registration (BP-defined nodes are registered fully
 		// on UFlowNodeBlueprint asset indexing - skipping them here keeps is_native correct).
@@ -948,6 +1086,24 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 				"pin_type_name, container_type, is_orphaned"
 				") VALUES (?, ?, ?, ?, ?, 'Exec', 'None', 1)"));
 
+			// Data-pin links live in the same map, keyed by the consumer's input pin and
+			// pointing at the producing node's output - the reverse of exec edges.
+			TSet<FName> CurrentInPinNames;
+			for (const FFlowPin& InPin : InPins)
+			{
+				CurrentInPinNames.Add(InPin.PinName);
+			}
+			if (const UEdGraphNode* EdNode = Node->GetGraphNode())
+			{
+				for (const UEdGraphPin* Pin : EdNode->Pins)
+				{
+					if (Pin && Pin->Direction == EGPD_Input)
+					{
+						CurrentInPinNames.Add(Pin->PinName);
+					}
+				}
+			}
+
 			int32 OrphanIdx = OutPins.Num();
 			for (int32 i = 0; i < Helper.GetMaxIndex(); ++i)
 			{
@@ -957,6 +1113,18 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 				if (!PinNamePtr || !ConnectedPtr) continue;
 				if (CurrentOutPinNames.Contains(*PinNamePtr)) continue;
 				if (!ConnectedPtr->NodeGuid.IsValid()) continue;
+
+				if (CurrentInPinNames.Contains(*PinNamePtr))
+				{
+					InsertConnection(ConnStmt, AssetId,
+						ConnectedPtr->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens),
+						ConnectedPtr->PinName.ToString(),
+						NodeGuidStr,
+						PinNamePtr->ToString(),
+						/*bIsOrphaned=*/false,
+						TEXT("data"));
+					continue;
+				}
 
 				if (bOrphanStmtOk)
 				{
@@ -1016,6 +1184,40 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		UE_LOG(LogMonolithFlowIndexer, Warning,
 			TEXT("FMonolithFlowIndexer: %s - %d node(s) carry a NodeGuid that differs from their key in UFlowAsset::Nodes (duplicated or imported nodes?). Indexed under the key, which is what Flow resolves nodes and connections by."),
 			*FaPath, GuidMismatchCount);
+	}
+
+	// ----- Property history: keep a snapshot whose properties the new one lost -----
+	for (const TPair<FString, FPreviousSnapshot>& Previous : PreviousSnapshots)
+	{
+		const FString* NewData = NewSnapshots.Find(Previous.Key);
+		if (!NewData)
+		{
+			continue;
+		}
+		TArray<FString> Removed;
+		const TSet<FString> NewKeys = TopLevelJsonKeys(*NewData);
+		for (const FString& Key : TopLevelJsonKeys(Previous.Value.Data))
+		{
+			if (!NewKeys.Contains(Key))
+			{
+				Removed.Add(Key);
+			}
+		}
+		if (Removed.Num() == 0)
+		{
+			continue;
+		}
+		Removed.Sort();
+		ExecWithStrings(RawDB, TEXT(
+			"INSERT INTO flow_node_history (fa_path, node_guid, node_class, data, indexed_at, removed_properties)"
+			" VALUES (?, ?, ?, ?, ?, ?)"),
+			{ FaPath, Previous.Key, Previous.Value.NodeClass, Previous.Value.Data, Previous.Value.IndexedAt, FString::Join(Removed, TEXT(",")) });
+		ExecWithStrings(RawDB, TEXT(
+			"DELETE FROM flow_node_history WHERE fa_path = ? AND node_guid = ? AND id NOT IN ("
+			"  SELECT id FROM flow_node_history WHERE fa_path = ? AND node_guid = ? ORDER BY id DESC LIMIT 5)"),
+			{ FaPath, Previous.Key, FaPath, Previous.Key });
+		UE_LOG(LogMonolithFlowIndexer, Log, TEXT("FMonolithFlowIndexer: %s node %s lost properties %s - previous snapshot kept in flow_node_history"),
+			*FaPath, *Previous.Key, *FString::Join(Removed, TEXT(", ")));
 	}
 
 	// ----- Editor-graph comment boxes -----
@@ -1172,6 +1374,8 @@ void FMonolithFlowIndexer::ReconcileWithAssets(FMonolithIndexDatabase& DB, bool 
 			// redirector resolves it to the new one, and so does the index.
 			ExecWithStrings(RawDB, TEXT("UPDATE flow_subgraph_refs SET target_fa_path = ? WHERE target_fa_path = ?"),
 				{ Move.NewPath, Move.OldPath });
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_node_history SET fa_path = ? WHERE fa_path = ?"),
+				{ Move.NewPath, Move.OldPath });
 			UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: followed rename %s -> %s"), *Move.OldPath, *Move.NewPath);
 		}
 		RenamedAssets = AssetMoves.Num();
@@ -1236,7 +1440,8 @@ void FMonolithFlowIndexer::ReconcileWithAssets(FMonolithIndexDatabase& DB, bool 
 			TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
 			TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
 			TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
-			TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)")
+			TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_node_history WHERE fa_path NOT IN (SELECT fa_path FROM flow_assets)")
 		};
 		for (const TCHAR* Sql : ChildSweeps)
 		{

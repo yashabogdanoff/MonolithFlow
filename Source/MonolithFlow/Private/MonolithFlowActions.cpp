@@ -52,9 +52,46 @@ namespace
 			.Replace(TEXT("?"), TEXT("_"));
 	}
 
-	/** Lookup flow_assets row id + asset id by fa_path. Returns -1 if not found. */
-	void SelectFlowAssetIds(FSQLiteDatabase* RawDB, const FString& FaPath, int64& OutRowId, int64& OutAssetId)
+	/**
+	 * fa_path is an object path ("/Game/Flow/Foo.Foo"). Callers often hold the package
+	 * path ("/Game/Flow/Foo") instead - complete it, since a package name never has a dot.
+	 */
+	FString ToFlowObjectPath(const FString& Path)
 	{
+		int32 LastSlash = INDEX_NONE;
+		if (Path.Contains(TEXT(".")) || !Path.FindLastChar(TEXT('/'), LastSlash) || LastSlash == Path.Len() - 1)
+		{
+			return Path;
+		}
+		return Path + TEXT(".") + Path.Mid(LastSlash + 1);
+	}
+
+	/** Read an optional integer param within [Min, Max]; false + OutError when it is out of range. */
+	bool ReadBoundedInt(const TSharedPtr<FJsonObject>& Params, const TCHAR* Name, int32 Default, int32 Min, int32 Max, int32& OutValue, FString& OutError)
+	{
+		OutValue = Default;
+		double Raw = 0.0;
+		if (!Params.IsValid() || !Params->TryGetNumberField(Name, Raw))
+		{
+			return true;
+		}
+		if (Raw < Min || Raw > Max || Raw != FMath::FloorToDouble(Raw))
+		{
+			OutError = FString::Printf(TEXT("%s must be an integer in [%d, %d]"), Name, Min, Max);
+			return false;
+		}
+		OutValue = static_cast<int32>(Raw);
+		return true;
+	}
+
+	/**
+	 * Lookup flow_assets row id + asset id by fa_path. Returns -1 if not found.
+	 * InOutFaPath is completed to the object path first, so callers echo the canonical form.
+	 */
+	void SelectFlowAssetIds(FSQLiteDatabase* RawDB, FString& InOutFaPath, int64& OutRowId, int64& OutAssetId)
+	{
+		InOutFaPath = ToFlowObjectPath(InOutFaPath);
+		const FString& FaPath = InOutFaPath;
 		OutRowId = -1;
 		OutAssetId = -1;
 		FSQLitePreparedStatement Stmt;
@@ -100,24 +137,26 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder().Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("list_assets"),
-		TEXT("List every UFlowAsset in the index, with node_count / addon_count / subgraph_count summary. Optional asset_path_filter is a glob (* and ?) matched against fa_path."),
+		TEXT("List UFlowAssets in the index, with node_count / addon_count / subgraph_count summary, ordered by fa_path and paged. Reports total + has_more so a truncated page is never mistaken for the whole project. Optional asset_path_filter is a glob (* and ?) matched against fa_path."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListAssets),
 		FParamSchemaBuilder()
 			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob pattern to filter fa_path (e.g., \"/Game/Flow/*\")"))
+			.Optional(TEXT("offset"), TEXT("number"), TEXT("Zero-based result offset"), TEXT("0"))
+			.Optional(TEXT("limit"), TEXT("number"), TEXT("Maximum assets to return (1-1000)"), TEXT("200"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("get_asset_info"),
 		TEXT("Return summary information for a single Flow Asset: name, asset class, expected owner class, world-bound flag, base-params soft path, total counts (nodes / addons / subgraphs / pins), and a sample of up to 10 nodes for orientation."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::GetAssetInfo),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path (e.g., \"/Game/Flow/MyScenario.MyScenario\")"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (e.g. \"/Game/Flow/MyScenario.MyScenario\") or package path (\"/Game/Flow/MyScenario\")"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("list_nodes"),
 		TEXT("List every UFlowNode inside one Flow Asset. Each row carries node_guid, node_class, display_name, is_blueprint flag, blueprint_path (if BP-defined), addon_count, input/output pin counts, and parsed `data` JSON of design-time UPROPERTYs. Optional node_class filter narrows the result."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListNodes),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("node_class"), TEXT("string"), TEXT("Exact UClass path filter (e.g. \"/Script/Flow.FlowNode_Start\")"))
 			.Build());
 
@@ -125,7 +164,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("List every pin (input + output) on nodes in one Flow Asset, with full type info (pin_type_name from FFlowPin, plus pin_subcategory_object such as the UClass path for Object pins). Optional filters narrow by node, direction, or pin type."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListNodePins),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Restrict to one node by its FGuid string"))
 			.Optional(TEXT("pin_direction"), TEXT("string"), TEXT("\"input\" | \"output\" | \"all\" (default)"))
 			.Optional(TEXT("pin_type_name"), TEXT("string"), TEXT("Restrict to pins with this PinTypeName (e.g. \"Exec\", \"Bool\", \"Object\")"))
@@ -135,7 +174,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("List every output-pin -> input-pin connection inside one Flow Asset (one row per outgoing edge). Optional from_node_guid / to_node_guid filters narrow the result."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListConnections),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("from_node_guid"), TEXT("string"), TEXT("Restrict to edges originating at this node"))
 			.Optional(TEXT("to_node_guid"), TEXT("string"), TEXT("Restrict to edges terminating at this node"))
 			.Build());
@@ -144,7 +183,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("List every UFlowNodeAddOn attached to nodes in one Flow Asset (recursive - addons can have child addons). Each row carries owner_node_guid, parent_addon_id (NULL for top-level), depth, addon_class, and parsed `data` JSON of the addon's design-time UPROPERTYs. Optional node_guid filter restricts to one node's addon stack."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListAddons),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Restrict to addons under this node"))
 			.Build());
 
@@ -152,7 +191,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Single-node deep dive. Joins the flow_nodes row with its parsed `data` JSON, every pin (with type info), every outgoing connection, and the recursive addon tree for one node identified by GUID inside one Flow Asset."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::GetNodeInfo),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node FGuid string (digits-with-hyphens, matches list_nodes output)"))
 			.Build());
 
@@ -160,7 +199,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("List Custom Inputs and Custom Outputs of one Flow Asset (the named entry/exit pins exposed to parent SubGraph nodes). Sourced from UFlowAsset::GatherCustomInputNodeEventNames / GatherCustomOutputNodeEventNames - runtime-safe, walks actual graph nodes."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListCustomEvents),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("kind"), TEXT("string"), TEXT("\"input\" | \"output\" | \"all\" (default)"))
 			.Build());
 
@@ -168,7 +207,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Cross-asset reverse lookup: every Flow Asset that hosts a UFlowNode_SubGraph referencing the target Flow Asset. Returns one row per call site (host_fa_path + host_node_guid + target_params_path). Optional asset_path_filter glob narrows the host search."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindSubgraphCallers),
 		FParamSchemaBuilder()
-			.Required(TEXT("target_asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path of the target subgraph (or its TopLevelAssetPath form for a soft reference)"))
+			.Required(TEXT("target_asset_path"), TEXT("string"), TEXT("Object path (/Pkg/Name.Name) or package path (/Pkg/Name) of the target subgraph"))
 			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host_fa_path"))
 			.Build());
 
@@ -176,7 +215,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Cross-asset reverse lookup: every Flow Asset containing a node of the specified UClass path. Returns rows grouped by host_fa_path with per-node guids. Optional asset_path_filter glob narrows the host search."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindNodeClassUsages),
 		FParamSchemaBuilder()
-			.Required(TEXT("node_class"), TEXT("string"), TEXT("Exact UClass path (e.g. \"/Script/SIMULATOR.SimulatorFlowNode_Dialogue\")"))
+			.Required(TEXT("node_class"), TEXT("string"), TEXT("Exact UClass path (e.g. \"/Script/Flow.FlowNode_Log\")"))
 			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host_fa_path"))
 			.Build());
 
@@ -213,7 +252,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("BFS over the (non-orphaned) execution edges of one Flow Asset. Entry set defaults to FlowNode_Start + FlowNode_CustomInput nodes; pass start_node_guid to walk from a specific node instead. Returns reached nodes with their BFS depth, unreachable nodes (present in the graph but never visited), and terminal reached nodes (no outgoing edges). Reads the index - save the asset first for fresh results."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::WalkExecution),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("start_node_guid"), TEXT("string"), TEXT("Walk from this node instead of the Start/CustomInput entry set"))
 			.Build());
 
@@ -221,7 +260,7 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("One-call compact dump of a whole Flow Asset: asset info, every node (guid, class, display name, editor position, pin counts; full data JSON when include_data=true), the complete edge list, graph comment boxes, and custom input/output events. Designed to replace a list_nodes + list_connections + list_custom_events round-trip when reasoning about a whole graph. Reads the index - save the asset first for fresh results."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ExportGraph),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("UFlowAsset object path (/Pkg/Name.Name) or package path (/Pkg/Name)"))
 			.Optional(TEXT("include_data"), TEXT("boolean"), TEXT("Include each node's full design-time data JSON (default false - counts and identity only)"))
 			.Build());
 
@@ -229,8 +268,8 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Structural diff of two Flow Assets by node guid: nodes only in A, only in B, nodes present in both whose class or data JSON differs, and execution edges added/removed. Useful for comparing scenario variants or verifying a refactor. Reads the index - save both assets first."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::DiffAssets),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path_a"), TEXT("string"), TEXT("Full UFlowAsset object path (baseline)"))
-			.Required(TEXT("asset_path_b"), TEXT("string"), TEXT("Full UFlowAsset object path (compared)"))
+			.Required(TEXT("asset_path_a"), TEXT("string"), TEXT("UFlowAsset object or package path (baseline)"))
+			.Required(TEXT("asset_path_b"), TEXT("string"), TEXT("UFlowAsset object or package path (compared)"))
 			.Build());
 }
 
@@ -258,16 +297,36 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 		Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
 	}
 
-	FString SQL = TEXT(
-		"SELECT fa_path, name, asset_class, expected_owner_class, base_params_path, "
-		"world_bound, node_count, addon_count, subgraph_count "
-		"FROM flow_assets");
+	int32 Offset = 0, Limit = 0;
+	if (!ReadBoundedInt(Params, TEXT("offset"), 0, 0, MAX_int32, Offset, Err)
+		|| !ReadBoundedInt(Params, TEXT("limit"), 200, 1, 1000, Limit, Err))
+	{
+		return FMonolithActionResult::Error(Err);
+	}
+
+	FString Where;
 	if (!PathFilter.IsEmpty())
 	{
-		const FString Like = GlobToLike(PathFilter);
-		SQL += FString::Printf(TEXT(" WHERE fa_path LIKE '%s'"), *Like);
+		Where = FString::Printf(TEXT(" WHERE fa_path LIKE '%s'"), *GlobToLike(PathFilter));
 	}
-	SQL += TEXT(" ORDER BY fa_path");
+
+	int64 Total = 0;
+	{
+		FSQLitePreparedStatement CountStmt;
+		if (CountStmt.Create(*RawDB, *(TEXT("SELECT COUNT(*) FROM flow_assets") + Where))
+			&& CountStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			CountStmt.GetColumnValueByIndex(0, Total);
+		}
+		CountStmt.Destroy();
+	}
+
+	const FString SQL = FString(TEXT(
+		"SELECT fa_path, name, asset_class, expected_owner_class, base_params_path, "
+		"world_bound, node_count, addon_count, subgraph_count "
+		"FROM flow_assets"))
+		+ Where
+		+ FString::Printf(TEXT(" ORDER BY fa_path LIMIT %d OFFSET %d"), Limit, Offset);
 
 	FSQLitePreparedStatement Stmt;
 	if (!Stmt.Create(*RawDB, *SQL))
@@ -307,6 +366,10 @@ FMonolithActionResult FMonolithFlowActions::ListAssets(const TSharedPtr<FJsonObj
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetArrayField(TEXT("assets"), Rows);
 	Result->SetNumberField(TEXT("count"), Rows.Num());
+	Result->SetNumberField(TEXT("offset"), Offset);
+	Result->SetNumberField(TEXT("limit"), Limit);
+	Result->SetNumberField(TEXT("total"), Total);
+	Result->SetBoolField(TEXT("has_more"), Offset + Rows.Num() < Total);
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -327,7 +390,7 @@ FMonolithActionResult FMonolithFlowActions::GetAssetInfo(const TSharedPtr<FJsonO
 	if (RowId <= 0)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("No Flow Asset indexed at path '%s'. Path must match UFlowAsset::GetPathName() (e.g. \"/Game/Flow/Foo.Foo\")."),
+			TEXT("No Flow Asset indexed at path '%s'. Pass the object path (\"/Game/Flow/Foo.Foo\") or the package path (\"/Game/Flow/Foo\")."),
 			*AssetPath));
 	}
 
@@ -1092,6 +1155,7 @@ FMonolithActionResult FMonolithFlowActions::FindSubgraphCallers(const TSharedPtr
 	{
 		return FMonolithActionResult::Error(TEXT("target_asset_path is required"));
 	}
+	TargetPath = ToFlowObjectPath(TargetPath);
 
 	FString PathFilter;
 	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);

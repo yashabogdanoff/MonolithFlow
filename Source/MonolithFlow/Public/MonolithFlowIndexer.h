@@ -29,6 +29,8 @@ class FMonolithIndexDatabase;
  *
  * NB: no FK on assets(id) (would block ResetDatabase on full reindex).
  * Cleanup keyed by stable fa_path (assets.id autoincrement restarts).
+ * The same missing FK means Monolith never tells these tables about a deleted
+ * or renamed package - ReconcileWithAssets() closes that gap.
  */
 class FMonolithFlowIndexer : public IMonolithIndexer
 {
@@ -36,6 +38,23 @@ public:
 	virtual TArray<FString> GetSupportedClasses() const override;
 	virtual bool IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId) override;
 	virtual FString GetName() const override { return TEXT("Flow"); }
+
+	/**
+	 * Bring flow_* in line with Monolith's own `assets` table. Monolith drops an
+	 * asset's rows on delete (CASCADE), moves them on rename (UpdateAssetPath keeps
+	 * the id) and wipes everything on a full pass (ResetDatabase); flow_* hangs off
+	 * none of those paths, so without this it keeps rows for packages that are gone.
+	 *
+	 * A flow_assets / Blueprint flow_node_classes row is live while the `assets` row
+	 * it was written for still exists under the same object path. Otherwise:
+	 *   - bFollowRenames: the id is still there with a new path of the same class and
+	 *     nothing else claims it - the row (and every path that mirrors it) moves along;
+	 *   - anything else is dropped, together with its child rows.
+	 * bSweepOrphans also clears child rows whose flow_assets parent is missing, which
+	 * costs a scan of each child table, so callers ask for it only on a full pass and
+	 * once per session. Game thread only, never while an index run owns the database.
+	 */
+	void ReconcileWithAssets(FMonolithIndexDatabase& DB, bool bFollowRenames, bool bSweepOrphans);
 
 private:
 	void EnsureTablesExist(FMonolithIndexDatabase& DB);

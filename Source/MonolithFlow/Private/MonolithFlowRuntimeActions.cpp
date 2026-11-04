@@ -3,6 +3,7 @@
 #if WITH_FLOW
 
 #include "MonolithParamSchema.h"
+#include "MonolithFlowNodeKey.h"
 
 #include "FlowAsset.h"
 #include "FlowComponent.h"
@@ -66,7 +67,7 @@ namespace
 	TSharedPtr<FJsonValue> MakeNodeRow(const UFlowNode* Node)
 	{
 		auto Row = MakeShared<FJsonObject>();
-		Row->SetStringField(TEXT("node_guid"), Node->GetGuid().ToString(EGuidFormats::DigitsWithHyphens));
+		Row->SetStringField(TEXT("node_guid"), MonolithFlow::NodeKeyString(Node));
 		Row->SetStringField(TEXT("node_class"), Node->GetClass()->GetPathName());
 #if WITH_EDITOR
 		Row->SetStringField(TEXT("display_name"), Node->GetNodeTitle().ToString());

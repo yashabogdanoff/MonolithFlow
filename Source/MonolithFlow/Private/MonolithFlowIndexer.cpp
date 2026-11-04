@@ -17,6 +17,7 @@
 #include "JsonObjectConverter.h"
 #include "Engine/Blueprint.h"
 #include "UObject/Class.h"
+#include "UObject/UObjectHash.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraphNode_Comment.h"
@@ -63,6 +64,58 @@ namespace
 		if (Stmt.Create(*RawDB, Sql))
 		{
 			Stmt.SetBindingValueByIndex(1, Param1);
+			Stmt.Execute();
+		}
+		Stmt.Destroy();
+	}
+
+	/**
+	 * Class path of UFlowAsset::GetExpectedOwnerClass(), which is a UClass* in
+	 * Flow 2.3 and a TSoftClassPtr from the 2.4 line on. The soft form is read as
+	 * a path, without loading the class.
+	 */
+	FString ClassPathOf(const UClass* Cls)
+	{
+		return Cls ? Cls->GetPathName() : FString();
+	}
+
+	template <typename T>
+	FString ClassPathOf(const TSoftClassPtr<T>& Cls)
+	{
+		return Cls.IsNull() ? FString() : Cls.ToSoftObjectPath().ToString();
+	}
+
+	/** Run a parameterless statement and return how many rows it changed. */
+	int64 ExecCountingChanges(FSQLiteDatabase* RawDB, const TCHAR* Sql)
+	{
+		if (!RawDB->Execute(Sql))
+		{
+			UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: statement failed (%s): %s"),
+				*RawDB->GetLastError(), Sql);
+			return 0;
+		}
+
+		int64 Changes = 0;
+		FSQLitePreparedStatement Stmt;
+		if (Stmt.Create(*RawDB, TEXT("SELECT changes()")) && Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Stmt.GetColumnValueByIndex(0, Changes);
+		}
+		Stmt.Destroy();
+		return Changes;
+	}
+
+	/** Run a statement whose parameters are all strings, in binding order. */
+	void ExecWithStrings(FSQLiteDatabase* RawDB, const TCHAR* Sql, std::initializer_list<FString> Params)
+	{
+		FSQLitePreparedStatement Stmt;
+		if (Stmt.Create(*RawDB, Sql))
+		{
+			int32 Index = 1;
+			for (const FString& Param : Params)
+			{
+				Stmt.SetBindingValueByIndex(Index++, Param);
+			}
 			Stmt.Execute();
 		}
 		Stmt.Destroy();
@@ -398,11 +451,28 @@ namespace
 
 TArray<FString> FMonolithFlowIndexer::GetSupportedClasses() const
 {
-	return {
-		TEXT("FlowAsset"),
+	// Monolith routes an asset to an indexer by the exact name of its asset class,
+	// so every native UFlowAsset subclass (AI flows, project-specific graph types)
+	// has to be listed by name, or its assets are never indexed. Read when the
+	// indexer is registered, after engine init, when plugin modules are loaded.
+	TArray<FString> Classes = {
+		UFlowAsset::StaticClass()->GetName(),
 		TEXT("FlowNodeBlueprint"),
 		TEXT("FlowNodeAddOnBlueprint")
 	};
+
+	TArray<UClass*> FlowAssetClasses;
+	GetDerivedClasses(UFlowAsset::StaticClass(), FlowAssetClasses, /*bRecursive=*/true);
+	for (const UClass* Cls : FlowAssetClasses)
+	{
+		if (Cls->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
+			|| Cls->ClassGeneratedBy != nullptr)
+		{
+			continue;
+		}
+		Classes.AddUnique(Cls->GetName());
+	}
+	return Classes;
 }
 
 void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
@@ -642,46 +712,46 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 	const FString FaPath = FA->GetPathName();
 
-	// ----- Cleanup of previous rows (stable key on fa_path) -----
+	// ----- Cleanup of previous rows -----
+	// Child rows key on fa_asset_id alone, and a full pass resets Monolith's
+	// `assets` table, so ids are handed out again while flow_* still holds rows
+	// written under the old ones. The id this asset gets now may be the old id
+	// of a different graph. Order matters:
+	//   1. AssetId is ours from now on: drop every flow_assets row holding it
+	//      (a stale row of another graph, or our own) and all children under it.
+	//      That graph, if it still exists, gets a fresh row when its turn comes.
+	//   2. Then drop our own previous row by path, and its children under the old
+	//      id. Nothing live can hold that id at this point: whichever graph took
+	//      it this pass already removed our row in its step 1.
+	// Deleting children by the old id first - the previous order - wiped the
+	// freshly written children of whichever graph had already taken that id.
+	auto DeleteChildrenOf = [RawDB](int64 FaAssetId)
+	{
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id = ?"), FaAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), FaAssetId);
+	};
+
+	DeleteChildrenOf(AssetId);
+	ExecWithInt64(RawDB, TEXT("DELETE FROM flow_assets WHERE fa_asset_id = ?"), AssetId);
+
 	int64 PrevRowId = -1;
 	int64 PrevAssetId = -1;
 	SelectExistingFlowAssetIds(RawDB, FaPath, PrevRowId, PrevAssetId);
-
-	if (PrevAssetId > 0)
-	{
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id = ?"), PrevAssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), PrevAssetId);
-	}
-	// Also clean by current AssetId in case PrevAssetId differs (autoincrement restart)
-	if (AssetId != PrevAssetId)
-	{
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id = ?"), AssetId);
-		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), AssetId);
-	}
-
 	if (PrevRowId > 0)
 	{
+		DeleteChildrenOf(PrevAssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_assets WHERE id = ?"), PrevRowId);
 	}
 
 	// ----- Insert flow_assets row (counts updated at end) -----
 	FString AssetGuidStr = FA->AssetGuid.IsValid() ? FA->AssetGuid.ToString(EGuidFormats::DigitsWithHyphens) : FString();
 
-	FString ExpectedOwnerClassPath;
-	if (UClass* OwnerCls = FA->GetExpectedOwnerClass())
-	{
-		ExpectedOwnerClassPath = OwnerCls->GetPathName();
-	}
+	const FString ExpectedOwnerClassPath = ClassPathOf(FA->GetExpectedOwnerClass());
 
 	FString BaseParamsPath = FA->BaseAssetParams.AssetPtr.ToSoftObjectPath().ToString();
 
@@ -770,13 +840,22 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		return false;
 	}
 
+	int32 GuidMismatchCount = 0;
 	for (const TPair<FGuid, UFlowNode*>& Pair : FA->GetNodes())
 	{
 		UFlowNode* Node = Pair.Value;
 		if (!Node) continue;
 		++NodeCount;
 
-		const FString NodeGuidStr = Node->GetGuid().ToString(EGuidFormats::DigitsWithHyphens);
+		// Identity is the key in UFlowAsset::Nodes: GetNode(), FConnectedPin and the
+		// runtime all resolve by it. A node's own NodeGuid normally equals the key,
+		// but duplicated or badly imported nodes can share one NodeGuid under
+		// distinct keys - indexing by NodeGuid would merge them and their edges.
+		if (Node->GetGuid() != Pair.Key)
+		{
+			++GuidMismatchCount;
+		}
+		const FString NodeGuidStr = Pair.Key.ToString(EGuidFormats::DigitsWithHyphens);
 		const FString NodeClassPath = Node->GetClass()->GetPathName();
 		const FString DisplayName = ResolveNodeDisplayName(Node);
 
@@ -853,7 +932,7 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 		// Orphan output pins - entries in the Connections map whose key isn't a current OutputPin.
 		// These are stale edges left over from previous versions of the node's pin set
-		// (e.g. SwitchOnScenario keeps per-scenario output pins even after a scenario was removed,
+		// (e.g. a node that generates one output pin per tag keeps the pin after the tag is removed,
 		// flagged as bOrphanedPin=True in the editor wrapper). Read Connections via FMapProperty
 		// reflection (it's protected, no public accessor for the whole map).
 		if (FMapProperty* ConnectionsProp = CastField<FMapProperty>(
@@ -931,6 +1010,13 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	AddOnStmt.Destroy();
 	SubGraphStmt.Destroy();
 	NativeClassRegStmt.Destroy();
+
+	if (GuidMismatchCount > 0)
+	{
+		UE_LOG(LogMonolithFlowIndexer, Warning,
+			TEXT("FMonolithFlowIndexer: %s - %d node(s) carry a NodeGuid that differs from their key in UFlowAsset::Nodes (duplicated or imported nodes?). Indexed under the key, which is what Flow resolves nodes and connections by."),
+			*FaPath, GuidMismatchCount);
+	}
 
 	// ----- Editor-graph comment boxes -----
 	if (const UEdGraph* Graph = FA->GetGraph())
@@ -1010,6 +1096,167 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: indexed %s - %d nodes, %d addons, %d subgraph refs"),
 		*FaPath, NodeCount, TotalAddonCount, SubGraphCount);
 	return true;
+}
+
+void FMonolithFlowIndexer::ReconcileWithAssets(FMonolithIndexDatabase& DB, bool bFollowRenames, bool bSweepOrphans)
+{
+	if (!DB.IsOpen()) return;
+	EnsureTablesExist(DB);
+
+	FSQLiteDatabase* RawDB = DB.GetRawDatabase();
+	if (!RawDB) return;
+
+	// fa_path / bp_path are object paths, so the core row is compared as
+	// package_path || '.' || asset_name. Cheap probe first: this runs on a timer
+	// and almost always finds nothing.
+	if (!bSweepOrphans)
+	{
+		int64 StaleCount = 0;
+		FSQLitePreparedStatement Probe;
+		if (Probe.Create(*RawDB, TEXT(
+			"SELECT EXISTS (SELECT 1 FROM flow_assets f WHERE NOT EXISTS ("
+			"  SELECT 1 FROM assets a WHERE a.id = f.fa_asset_id AND a.package_path || '.' || a.asset_name = f.fa_path))"
+			" OR EXISTS (SELECT 1 FROM flow_node_classes c WHERE c.is_native = 0 AND NOT EXISTS ("
+			"  SELECT 1 FROM assets a WHERE a.id = c.bp_asset_id AND a.package_path || '.' || a.asset_name = c.bp_path))"))
+			&& Probe.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Probe.GetColumnValueByIndex(0, StaleCount);
+		}
+		Probe.Destroy();
+		if (StaleCount == 0) return;
+	}
+
+	if (!DB.BeginTransaction())
+	{
+		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: could not open a transaction to reconcile flow_* with assets"));
+		return;
+	}
+
+	int32 RenamedAssets = 0;
+	int32 RenamedClasses = 0;
+
+	if (bFollowRenames)
+	{
+		// Flow assets: same id, same class, new path, and no other row claims either
+		// the id or the new path. After a full reset ids are reused by unrelated
+		// assets, which is why callers never follow renames across one.
+		struct FMove { FString OldPath, NewPath, NewName; };
+		TArray<FMove> AssetMoves;
+		{
+			FSQLitePreparedStatement Stmt;
+			if (Stmt.Create(*RawDB, TEXT(
+				"SELECT f.fa_path, a.package_path || '.' || a.asset_name, a.asset_name"
+				" FROM flow_assets f JOIN assets a ON a.id = f.fa_asset_id"
+				" WHERE f.fa_path <> a.package_path || '.' || a.asset_name"
+				"   AND a.asset_class = f.asset_class"
+				"   AND (SELECT COUNT(*) FROM flow_assets o WHERE o.fa_asset_id = f.fa_asset_id) = 1"
+				"   AND NOT EXISTS (SELECT 1 FROM flow_assets o WHERE o.fa_path = a.package_path || '.' || a.asset_name)")))
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					FMove& Move = AssetMoves.AddDefaulted_GetRef();
+					Stmt.GetColumnValueByIndex(0, Move.OldPath);
+					Stmt.GetColumnValueByIndex(1, Move.NewPath);
+					Stmt.GetColumnValueByIndex(2, Move.NewName);
+				}
+			}
+			Stmt.Destroy();
+		}
+		for (const FMove& Move : AssetMoves)
+		{
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_assets SET fa_path = ?, name = ? WHERE fa_path = ?"),
+				{ Move.NewPath, Move.NewName, Move.OldPath });
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_subgraph_refs SET host_fa_path = ? WHERE host_fa_path = ?"),
+				{ Move.NewPath, Move.OldPath });
+			// Callers still hold the old soft path until they are re-saved; the
+			// redirector resolves it to the new one, and so does the index.
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_subgraph_refs SET target_fa_path = ? WHERE target_fa_path = ?"),
+				{ Move.NewPath, Move.OldPath });
+			UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: followed rename %s -> %s"), *Move.OldPath, *Move.NewPath);
+		}
+		RenamedAssets = AssetMoves.Num();
+
+		// Node / addon Blueprints: the generated class moves with the asset.
+		struct FClassMove { FString OldBpPath, NewBpPath, OldClassPath; };
+		TArray<FClassMove> ClassMoves;
+		{
+			FSQLitePreparedStatement Stmt;
+			if (Stmt.Create(*RawDB, TEXT(
+				"SELECT c.bp_path, a.package_path || '.' || a.asset_name, c.class_path"
+				" FROM flow_node_classes c JOIN assets a ON a.id = c.bp_asset_id"
+				" WHERE c.is_native = 0 AND c.bp_path <> a.package_path || '.' || a.asset_name"
+				"   AND a.asset_class IN ('FlowNodeBlueprint', 'FlowNodeAddOnBlueprint')"
+				"   AND (SELECT COUNT(*) FROM flow_node_classes o WHERE o.is_native = 0 AND o.bp_asset_id = c.bp_asset_id) = 1"
+				"   AND NOT EXISTS (SELECT 1 FROM flow_node_classes o WHERE o.class_path = a.package_path || '.' || a.asset_name || '_C')")))
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					FClassMove& Move = ClassMoves.AddDefaulted_GetRef();
+					Stmt.GetColumnValueByIndex(0, Move.OldBpPath);
+					Stmt.GetColumnValueByIndex(1, Move.NewBpPath);
+					Stmt.GetColumnValueByIndex(2, Move.OldClassPath);
+				}
+			}
+			Stmt.Destroy();
+		}
+		for (const FClassMove& Move : ClassMoves)
+		{
+			const FString NewClassPath = Move.NewBpPath + TEXT("_C");
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_node_classes SET bp_path = ?, class_path = ? WHERE bp_path = ?"),
+				{ Move.NewBpPath, NewClassPath, Move.OldBpPath });
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_nodes SET node_class = ?, blueprint_path = ? WHERE node_class = ?"),
+				{ NewClassPath, Move.NewBpPath, Move.OldClassPath });
+			ExecWithStrings(RawDB, TEXT("UPDATE flow_node_addons SET addon_class = ? WHERE addon_class = ?"),
+				{ NewClassPath, Move.OldClassPath });
+			UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: followed class rename %s -> %s"), *Move.OldClassPath, *NewClassPath);
+		}
+		RenamedClasses = ClassMoves.Num();
+	}
+
+	const int64 DroppedAssets = ExecCountingChanges(RawDB, TEXT(
+		"DELETE FROM flow_assets WHERE NOT EXISTS ("
+		"  SELECT 1 FROM assets a WHERE a.id = flow_assets.fa_asset_id"
+		"  AND a.package_path || '.' || a.asset_name = flow_assets.fa_path)"));
+	const int64 DroppedClasses = ExecCountingChanges(RawDB, TEXT(
+		"DELETE FROM flow_node_classes WHERE is_native = 0 AND NOT EXISTS ("
+		"  SELECT 1 FROM assets a WHERE a.id = flow_node_classes.bp_asset_id"
+		"  AND a.package_path || '.' || a.asset_name = flow_node_classes.bp_path)"));
+
+	// Child rows key on fa_asset_id only. One left behind by a dropped parent
+	// shares nothing with a live asset unless that asset reused the id - and then
+	// IndexAsset already replaced them, so anything without a parent is garbage.
+	int64 DroppedChildren = 0;
+	if (bSweepOrphans || DroppedAssets > 0)
+	{
+		static const TCHAR* ChildSweeps[] =
+		{
+			TEXT("DELETE FROM flow_nodes WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)"),
+			TEXT("DELETE FROM flow_graph_comments WHERE fa_asset_id NOT IN (SELECT fa_asset_id FROM flow_assets)")
+		};
+		for (const TCHAR* Sql : ChildSweeps)
+		{
+			DroppedChildren += ExecCountingChanges(RawDB, Sql);
+		}
+	}
+
+	if (!DB.CommitTransaction())
+	{
+		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: reconcile commit failed (%s), rolling back"), *RawDB->GetLastError());
+		DB.RollbackTransaction();
+		return;
+	}
+
+	if (RenamedAssets + RenamedClasses + DroppedAssets + DroppedClasses + DroppedChildren > 0)
+	{
+		UE_LOG(LogMonolithFlowIndexer, Log,
+			TEXT("FMonolithFlowIndexer: reconciled with assets - followed %d asset and %d class renames, dropped %lld stale assets, %lld stale classes, %lld orphan child rows"),
+			RenamedAssets, RenamedClasses, DroppedAssets, DroppedClasses, DroppedChildren);
+	}
 }
 
 #endif // WITH_FLOW

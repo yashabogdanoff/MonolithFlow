@@ -5,6 +5,7 @@
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 #include "IMonolithGraphFormatter.h"
+#include "MonolithFlowNodeKey.h"
 
 #include "FlowAsset.h"
 #include "Nodes/FlowNode.h"
@@ -20,12 +21,15 @@
 
 #include "Editor.h"
 #include "ScopedTransaction.h"
+#include "Editor/Transactor.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "EditorAssetLibrary.h"
 #include "EditorValidatorSubsystem.h"
 #include "Misc/DataValidation.h"
 #include "JsonObjectConverter.h"
+#include "Misc/OutputDeviceNull.h"
+#include "UObject/StructOnScope.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Algo/MaxElement.h"
@@ -111,35 +115,183 @@ namespace
 	}
 
 	/**
-	 * Apply a JSON object onto a node's UPROPERTYs. Reports unknown top-level
-	 * keys instead of silently ignoring them (typo protection for the caller).
+	 * Expected JSON shape for a property, in the form get_node_info's `data` snapshot
+	 * writes it, or null when the value is acceptable. FJsonObjectConverter does not
+	 * reject a mismatch - an object handed to a bool becomes false and the call
+	 * reports success - so the shape is checked up front.
 	 */
-	bool ApplyPropertiesJson(UObject* Target, const TSharedPtr<FJsonObject>& Props, FString& OutError)
+	const TCHAR* JsonShapeMismatch(const FProperty* Prop, const TSharedPtr<FJsonValue>& Value)
 	{
-		TArray<FString> Unknown;
+		const EJson Type = Value.IsValid() ? Value->Type : EJson::None;
+		auto Expect = [Type](bool bOk, const TCHAR* Expected) -> const TCHAR* { return bOk ? nullptr : Expected; };
+
+		if (Prop->ArrayDim > 1)                         return Expect(Type == EJson::Array, TEXT("array"));
+		if (CastField<FBoolProperty>(Prop))             return Expect(Type == EJson::Boolean, TEXT("boolean"));
+		if (const FNumericProperty* Num = CastField<FNumericProperty>(Prop))
+		{
+			return Num->IsEnum()
+				? Expect(Type == EJson::String || Type == EJson::Number, TEXT("enum name or number"))
+				: Expect(Type == EJson::Number, TEXT("number"));
+		}
+		if (CastField<FEnumProperty>(Prop))             return Expect(Type == EJson::String || Type == EJson::Number, TEXT("enum name or number"));
+		if (CastField<FStrProperty>(Prop) || CastField<FNameProperty>(Prop) || CastField<FTextProperty>(Prop))
+		{
+			return Expect(Type == EJson::String, TEXT("string"));
+		}
+		if (CastField<FObjectPropertyBase>(Prop) || CastField<FSoftObjectProperty>(Prop) || CastField<FInterfaceProperty>(Prop))
+		{
+			return Expect(Type == EJson::String || Type == EJson::Null, TEXT("object path string or null"));
+		}
+		if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop)) return Expect(Type == EJson::Array, TEXT("array"));
+		if (CastField<FMapProperty>(Prop))              return Expect(Type == EJson::Object, TEXT("object"));
+		if (const FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			if (Type == EJson::String)
+			{
+				// The converter hands a string to ImportText and ignores a parse
+				// failure, so try the parse here on a scratch value.
+				FStructOnScope Scratch(StructProp->Struct);
+				FOutputDeviceNull Quiet;
+				const bool bParses = StructProp->ImportText_Direct(
+					*Value->AsString(), Scratch.GetStructMemory(), nullptr, PPF_None, &Quiet) != nullptr;
+				return Expect(bParses, TEXT("object, or export text that parses, e.g. (R=255,G=0,B=0,A=255)"));
+			}
+			return Expect(Type == EJson::Object, TEXT("object or export-text string"));
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Check the top-level keys of a property JSON against a class before anything
+	 * is touched: unknown keys are typos; only properties the Details panel could
+	 * edit are accepted - the rest (NodeGuid, pin arrays, internal state) would
+	 * corrupt the node; and each value must have the JSON shape of its property.
+	 * Nested struct members are left to the converter.
+	 */
+	bool ValidatePropertyKeys(const UClass* Cls, const TSharedPtr<FJsonObject>& Props, FString& OutError)
+	{
+		TArray<FString> Unknown, ReadOnly, WrongShape;
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
 		{
-			if (!Target->GetClass()->FindPropertyByName(FName(*Pair.Key)))
+			const FProperty* Prop = Cls->FindPropertyByName(FName(*Pair.Key));
+			if (!Prop)
 			{
 				Unknown.Add(Pair.Key);
 			}
+			else if (!Prop->HasAnyPropertyFlags(CPF_Edit) || Prop->HasAnyPropertyFlags(CPF_EditConst))
+			{
+				ReadOnly.Add(Pair.Key);
+			}
+			else if (const TCHAR* Expected = JsonShapeMismatch(Prop, Pair.Value))
+			{
+				WrongShape.Add(FString::Printf(TEXT("%s (expects %s)"), *Pair.Key, Expected));
+			}
+		}
+		if (WrongShape.Num() > 0 && Unknown.Num() == 0 && ReadOnly.Num() == 0)
+		{
+			OutError = FString::Printf(TEXT("Values of the wrong JSON type for %s: %s"),
+				*Cls->GetName(), *FString::Join(WrongShape, TEXT(", ")));
+			return false;
 		}
 		if (Unknown.Num() > 0)
 		{
 			OutError = FString::Printf(TEXT("Unknown properties on %s: %s"),
-				*Target->GetClass()->GetName(), *FString::Join(Unknown, TEXT(", ")));
+				*Cls->GetName(), *FString::Join(Unknown, TEXT(", ")));
 			return false;
+		}
+		if (ReadOnly.Num() > 0)
+		{
+			OutError = FString::Printf(TEXT("Properties of %s that are not editable in the Details panel: %s"),
+				*Cls->GetName(), *FString::Join(ReadOnly, TEXT(", ")));
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Apply a JSON object onto a node's UPROPERTYs, keys already checked by
+	 * ValidatePropertyKeys. Each property gets its own Pre/PostEditChange, the same
+	 * notification an edit in the Details panel sends, so nodes that rebuild pins
+	 * or caches on a specific property see it.
+	 */
+	bool ApplyPropertiesJson(UObject* Target, const TSharedPtr<FJsonObject>& Props, FString& OutError)
+	{
+		TArray<FProperty*> Changed;
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+		{
+			Changed.Add(Target->GetClass()->FindPropertyByName(FName(*Pair.Key)));
 		}
 
 		Target->Modify();
-		if (!FJsonObjectConverter::JsonObjectToUStruct(
-				Props.ToSharedRef(), Target->GetClass(), Target, /*CheckFlags=*/0, /*SkipFlags=*/0))
+		for (FProperty* Prop : Changed)
 		{
-			OutError = FString::Printf(TEXT("Failed to apply property JSON to %s"), *Target->GetClass()->GetName());
+			Target->PreEditChange(Prop);
+		}
+		const bool bApplied = FJsonObjectConverter::JsonObjectToUStruct(
+			Props.ToSharedRef(), Target->GetClass(), Target, /*CheckFlags=*/0, /*SkipFlags=*/0);
+		for (FProperty* Prop : Changed)
+		{
+			FPropertyChangedEvent Event(Prop, EPropertyChangeType::ValueSet);
+			Target->PostEditChangeProperty(Event);
+		}
+
+		if (!bApplied)
+		{
+			OutError = FString::Printf(TEXT("Failed to apply property JSON to %s (a value does not match its property type)"),
+				*Target->GetClass()->GetName());
 			return false;
 		}
-		Target->PostEditChange();
 		return true;
+	}
+
+	/**
+	 * Marks the head of the undo buffer before a mutation, so one that fails
+	 * halfway can be reverted for real: FScopedTransaction::Cancel only drops the
+	 * undo record and keeps the edits. RollBack undoes the newest transaction only
+	 * when it was opened after the mark, never an older edit of the user's.
+	 */
+	struct FUndoMark
+	{
+		FGuid HeadBefore;
+
+		FUndoMark()
+		{
+			if (GEditor && GEditor->Trans)
+			{
+				HeadBefore = GEditor->Trans->GetUndoContext(/*bCheckWhetherUndoPossible=*/false).TransactionId;
+			}
+		}
+
+		bool RollBack() const
+		{
+			if (!GEditor || !GEditor->Trans)
+			{
+				return false;
+			}
+			const FGuid Head = GEditor->Trans->GetUndoContext(/*bCheckWhetherUndoPossible=*/false).TransactionId;
+			if (!Head.IsValid() || Head == HeadBefore)
+			{
+				return false;
+			}
+			return GEditor->UndoTransaction(/*bCanRedo=*/false);
+		}
+
+		/** Error text for a failed mutation, saying whether the graph is back to where it was. */
+		FString RollBackAndExplain(const FString& Error) const
+		{
+			return RollBack()
+				? Error + TEXT(" - the change was rolled back")
+				: Error + TEXT(" - the change could NOT be rolled back, check the graph (editor Undo may revert it)");
+		}
+	};
+
+	/** "<node guid>.<pin name>" for a pin on a Flow graph node. */
+	FString DescribePin(const UEdGraphPin* Pin)
+	{
+		const UFlowGraphNode* Owner = Pin ? Cast<UFlowGraphNode>(Pin->GetOwningNode()) : nullptr;
+		const UFlowNode* RuntimeNode = Owner ? Cast<UFlowNode>(Owner->GetFlowNodeBase()) : nullptr;
+		const FString Guid = RuntimeNode ? MonolithFlow::NodeKeyString(RuntimeNode) : TEXT("?");
+		return FString::Printf(TEXT("%s.%s"), *Guid, Pin ? *Pin->PinName.ToString() : TEXT("?"));
 	}
 
 	/** Optional bSave param: save the asset after a successful mutation. */
@@ -158,7 +310,7 @@ namespace
 
 	FString GuidStrOf(const UFlowNode* Node)
 	{
-		return Node->GetGuid().ToString(EGuidFormats::DigitsWithHyphens);
+		return MonolithFlow::NodeKeyString(Node);
 	}
 }
 
@@ -191,11 +343,11 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Build());
 
 	Registry.RegisterAction(TEXT("flow"), TEXT("add_node"),
-		TEXT("Add a node of the given UFlowNode subclass to a Flow Asset at (pos_x, pos_y). Optional `properties` JSON is applied onto the fresh node's UPROPERTYs (same shape as the `data` snapshot from get_node_info) and its pins are rebuilt - so context-pin nodes (e.g. scenario switches) come up with correct pins. Returns the new node_guid. Mutates the LIVE asset; pass save=true (or call save_asset later) to persist and refresh the index."),
+		TEXT("Add a node of the given UFlowNode subclass to a Flow Asset at (pos_x, pos_y). Optional `properties` JSON is applied onto the fresh node's UPROPERTYs (same shape as the `data` snapshot from get_node_info) and its pins are rebuilt - so context-pin nodes (e.g. tag-driven switches) come up with correct pins. Returns the new node_guid. Mutates the LIVE asset; pass save=true (or call save_asset later) to persist and refresh the index."),
 		FMonolithActionHandler::CreateStatic(&FMonolithFlowAuthorActions::AddNode),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
-			.Required(TEXT("node_class"), TEXT("string"), TEXT("UFlowNode subclass path, e.g. \"/Script/SIMULATOR.SimulatorFlowNode_Narrator\""))
+			.Required(TEXT("node_class"), TEXT("string"), TEXT("UFlowNode subclass path, e.g. \"/Script/Flow.FlowNode_Log\""))
 			.Optional(TEXT("pos_x"), TEXT("integer"), TEXT("Graph X position (default 0)"))
 			.Optional(TEXT("pos_y"), TEXT("integer"), TEXT("Graph Y position (default 0)"))
 			.Optional(TEXT("properties"), TEXT("object"), TEXT("Property JSON to apply onto the new node"))
@@ -240,7 +392,7 @@ void FMonolithFlowAuthorActions::RegisterActions(FMonolithToolRegistry& Registry
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
 			.Required(TEXT("from_node_guid"), TEXT("string"), TEXT("Source node guid"))
-			.Required(TEXT("from_pin"), TEXT("string"), TEXT("Source OUTPUT pin name (e.g. \"Out\", \"Completed\", \"Scenario_2\")"))
+			.Required(TEXT("from_pin"), TEXT("string"), TEXT("Source OUTPUT pin name (e.g. \"Out\", \"Completed\", \"Step\")"))
 			.Required(TEXT("to_node_guid"), TEXT("string"), TEXT("Target node guid"))
 			.Optional(TEXT("to_pin"), TEXT("string"), TEXT("Target INPUT pin name (default \"In\")"))
 			.Optional(TEXT("save"), TEXT("boolean"), TEXT("Save the asset after the edit (default false)"))
@@ -410,36 +562,57 @@ FMonolithActionResult FMonolithFlowAuthorActions::AddNode(const TSharedPtr<FJson
 	Params->TryGetNumberField(TEXT("pos_x"), PosX);
 	Params->TryGetNumberField(TEXT("pos_y"), PosY);
 
-	const FScopedTransaction Transaction(LOCTEXT("AddFlowNode", "Monolith: Add Flow Node"));
-	FA->Modify();
-	Graph->Modify();
-
-	UFlowGraphNode* GraphNode = FFlowGraphSchemaAction_NewNode::CreateNode(
-		Graph, /*FromPin=*/nullptr, NodeClass,
-		FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)), /*bSelectNewNode=*/false);
-	if (!GraphNode)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Schema refused to create node of class %s"), *ClassPath));
-	}
-
-	UFlowNode* Node = Cast<UFlowNode>(GraphNode->GetFlowNodeBase());
-	if (!Node)
-	{
-		return FMonolithActionResult::Error(TEXT("Created graph node has no runtime UFlowNode"));
-	}
-
 	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
-	if (Params->TryGetObjectField(TEXT("properties"), PropsObj) && PropsObj && PropsObj->IsValid())
+	const bool bHasProps = Params->TryGetObjectField(TEXT("properties"), PropsObj) && PropsObj && PropsObj->IsValid();
+	if (bHasProps && !ValidatePropertyKeys(NodeClass, *PropsObj, Err))
 	{
-		if (!ApplyPropertiesJson(Node, *PropsObj, Err))
-		{
-			return FMonolithActionResult::Error(Err);
-		}
-		// Rebuild pins so context-pin nodes reflect the fresh property state.
-		GraphNode->ReconstructNode();
+		return FMonolithActionResult::Error(Err);
 	}
 
-	FA->MarkPackageDirty();
+	UFlowNode* Node = nullptr;
+	const FUndoMark UndoMark;
+	bool bRollBack = false;
+	{
+		const FScopedTransaction Transaction(LOCTEXT("AddFlowNode", "Monolith: Add Flow Node"));
+		FA->Modify();
+		Graph->Modify();
+
+		UFlowGraphNode* GraphNode = FFlowGraphSchemaAction_NewNode::CreateNode(
+			Graph, /*FromPin=*/nullptr, NodeClass,
+			FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)), /*bSelectNewNode=*/false);
+		Node = GraphNode ? Cast<UFlowNode>(GraphNode->GetFlowNodeBase()) : nullptr;
+		if (!GraphNode)
+		{
+			Err = FString::Printf(TEXT("Schema refused to create node of class %s"), *ClassPath);
+			bRollBack = true;
+		}
+		else if (!Node)
+		{
+			Err = TEXT("Created graph node has no runtime UFlowNode");
+			bRollBack = true;
+		}
+		else if (bHasProps)
+		{
+			if (ApplyPropertiesJson(Node, *PropsObj, Err))
+			{
+				// Rebuild pins so context-pin nodes reflect the fresh property state.
+				GraphNode->ReconstructNode();
+			}
+			else
+			{
+				bRollBack = true;
+			}
+		}
+
+		if (!bRollBack)
+		{
+			FA->MarkPackageDirty();
+		}
+	}
+	if (bRollBack)
+	{
+		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(Err));
+	}
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
@@ -481,16 +654,32 @@ FMonolithActionResult FMonolithFlowAuthorActions::SetNodeProperties(const TShare
 	UFlowGraphNode* GraphNode = GraphNodeOf(Node, Err);
 	if (!GraphNode) return FMonolithActionResult::Error(Err);
 
-	const FScopedTransaction Transaction(LOCTEXT("SetFlowNodeProperties", "Monolith: Set Flow Node Properties"));
-	FA->Modify();
-
-	if (!ApplyPropertiesJson(Node, *PropsObj, Err))
+	if (!ValidatePropertyKeys(Node->GetClass(), *PropsObj, Err))
 	{
 		return FMonolithActionResult::Error(Err);
 	}
-	GraphNode->ReconstructNode();
-	FA->HarvestNodeConnections();
-	FA->MarkPackageDirty();
+
+	const FUndoMark UndoMark;
+	bool bRollBack = false;
+	{
+		const FScopedTransaction Transaction(LOCTEXT("SetFlowNodeProperties", "Monolith: Set Flow Node Properties"));
+		FA->Modify();
+
+		if (ApplyPropertiesJson(Node, *PropsObj, Err))
+		{
+			GraphNode->ReconstructNode();
+			FA->HarvestNodeConnections();
+			FA->MarkPackageDirty();
+		}
+		else
+		{
+			bRollBack = true;
+		}
+	}
+	if (bRollBack)
+	{
+		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(Err));
+	}
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
@@ -531,7 +720,7 @@ FMonolithActionResult FMonolithFlowAuthorActions::RemoveNode(const TSharedPtr<FJ
 	Graph->Modify();
 	GraphNode->Modify();
 
-	const FGuid RuntimeGuid = Node->GetGuid();
+	const FGuid RuntimeGuid = MonolithFlow::NodeKeyOf(Node);
 	Schema->BreakNodeLinks(*GraphNode);
 	GraphNode->DestroyNode();
 	// DestroyNode only removes the editor wrapper - the runtime node must be
@@ -646,26 +835,58 @@ FMonolithActionResult FMonolithFlowAuthorActions::ConnectPins(const TSharedPtr<F
 		return FMonolithActionResult::Error(TEXT("Graph schema not available"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("ConnectFlowPins", "Monolith: Connect Flow Pins"));
-	FA->Modify();
-	FromGraphNode->Modify();
-	ToGraphNode->Modify();
+	// The schema may break existing links to make room (an exec output drives one
+	// input, a data input reads one output) - exactly as a wire dragged in the
+	// editor does. Remember them so the answer says what was replaced.
+	TArray<TPair<UEdGraphPin*, UEdGraphPin*>> LinksBefore;
+	for (UEdGraphPin* Linked : FromPin->LinkedTo) LinksBefore.Emplace(FromPin, Linked);
+	for (UEdGraphPin* Linked : ToPin->LinkedTo)   LinksBefore.Emplace(Linked, ToPin);
 
-	if (!Schema->TryCreateConnection(FromPin, ToPin))
+	const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
+	if (Response.Response == CONNECT_RESPONSE_DISALLOW)
 	{
-		const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Schema refused connection %s.%s -> %s.%s: %s"),
 			*FromGuid, *FromPinName, *ToGuid, *ToPinName, *Response.Message.ToString()));
 	}
 
-	FA->HarvestNodeConnections();
-	FA->MarkPackageDirty();
+	const FUndoMark UndoMark;
+	bool bConnected = false;
+	{
+		const FScopedTransaction Transaction(LOCTEXT("ConnectFlowPins", "Monolith: Connect Flow Pins"));
+		FA->Modify();
+		FromGraphNode->Modify();
+		ToGraphNode->Modify();
+
+		bConnected = Schema->TryCreateConnection(FromPin, ToPin);
+		if (bConnected)
+		{
+			FA->HarvestNodeConnections();
+			FA->MarkPackageDirty();
+		}
+	}
+	if (!bConnected)
+	{
+		return FMonolithActionResult::Error(UndoMark.RollBackAndExplain(FString::Printf(
+			TEXT("Schema failed to connect %s.%s -> %s.%s"),
+			*FromGuid, *FromPinName, *ToGuid, *ToPinName)));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> BrokenLinks;
+	for (const TPair<UEdGraphPin*, UEdGraphPin*>& Link : LinksBefore)
+	{
+		if (!Link.Key->LinkedTo.Contains(Link.Value))
+		{
+			BrokenLinks.Add(MakeShared<FJsonValueString>(
+				FString::Printf(TEXT("%s -> %s"), *DescribePin(Link.Key), *DescribePin(Link.Value))));
+		}
+	}
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset_path"), FA->GetPathName());
 	Result->SetStringField(TEXT("from"), FString::Printf(TEXT("%s.%s"), *FromGuid, *FromPinName));
 	Result->SetStringField(TEXT("to"), FString::Printf(TEXT("%s.%s"), *ToGuid, *ToPinName));
+	Result->SetArrayField(TEXT("broken_links"), BrokenLinks);
 	if (!MaybeSave(Params, FA, Result))
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Connected but failed to save %s"), *FA->GetPathName()));

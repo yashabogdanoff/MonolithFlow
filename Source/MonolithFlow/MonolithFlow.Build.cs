@@ -1,6 +1,7 @@
 using UnrealBuildTool;
+using Microsoft.Extensions.Logging;
+using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 
 public class MonolithFlow : ModuleRules
 {
@@ -13,7 +14,21 @@ public class MonolithFlow : ModuleRules
 		bool bReleaseBuild =
 			System.Environment.GetEnvironmentVariable("MONOLITH_RELEASE_BUILD") == "1";
 
-		bool bHasFlow = !bReleaseBuild && DetectFlowPlugin(Target);
+		string FlowUplugin = bReleaseBuild ? null : FindFlowPlugin(Target);
+		bool bHasFlow = FlowUplugin != null;
+
+		if (bReleaseBuild)
+		{
+			Logger.LogInformation("MonolithFlow: MONOLITH_RELEASE_BUILD=1, building the inactive stub");
+		}
+		else if (bHasFlow)
+		{
+			Logger.LogInformation("MonolithFlow: Flow plugin found at {Path}", FlowUplugin);
+		}
+		else
+		{
+			Logger.LogInformation("MonolithFlow: Flow plugin not found, building the inactive stub (no flow actions)");
+		}
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
@@ -58,37 +73,76 @@ public class MonolithFlow : ModuleRules
 	}
 
 	/// <summary>
-	/// Probe the three canonical install locations for the MothCocoon Flow plugin.
-	/// Matches on Flow.uplugin presence, not folder-name globs - a sibling like
-	/// "FlowValidation/" must not count as a hit.
+	/// Locate the MothCocoon Flow plugin: anywhere under the project's Plugins tree
+	/// (a GitHub clone lands in "FlowGraph", some projects nest plugins in subfolders),
+	/// anywhere under the engine's Plugins/Marketplace (Fab obfuscates folder names),
+	/// or at Engine/Plugins/Flow. Matches on the Flow.uplugin file name, which is what
+	/// gives the plugin its name - folder-name globs would also hit neighbours like
+	/// "FlowValidation/". Returns the descriptor path, or null when Flow is absent.
 	/// </summary>
-	private static bool DetectFlowPlugin(ReadOnlyTargetRules Target)
+	private static string FindFlowPlugin(ReadOnlyTargetRules Target)
 	{
-		static bool HasFlowUplugin(string root) =>
-			Directory.Exists(root) && File.Exists(Path.Combine(root, "Flow.uplugin"));
-
-		// 1. Project Plugins/Flow (canonical install location)
+		var Roots = new List<string>();
 		if (Target.ProjectFile != null)
 		{
-			string projectRoot = Path.Combine(
-				Target.ProjectFile.Directory.FullName, "Plugins", "Flow");
-			if (HasFlowUplugin(projectRoot))
+			Roots.Add(Path.Combine(Target.ProjectFile.Directory.FullName, "Plugins"));
+		}
+
+		string EngineDir = Path.GetFullPath(Target.RelativeEnginePath);
+		Roots.Add(Path.Combine(EngineDir, "Plugins", "Marketplace"));
+		Roots.Add(Path.Combine(EngineDir, "Plugins", "Flow"));
+
+		foreach (string Root in Roots)
+		{
+			string Found = FindUpluginUnder(Root, "Flow.uplugin");
+			if (Found != null)
 			{
-				return true;
+				return Found;
 			}
 		}
+		return null;
+	}
 
-		string engineDir = Path.GetFullPath(Target.RelativeEnginePath);
-
-		// 2. Engine Plugins/Marketplace/ - recursive scan survives Fab folder-name obfuscation
-		string marketplaceDir = Path.Combine(engineDir, "Plugins", "Marketplace");
-		if (Directory.Exists(marketplaceDir) &&
-			Directory.GetFiles(marketplaceDir, "Flow.uplugin", SearchOption.AllDirectories).Any())
+	/// <summary>
+	/// Depth-first search for a plugin descriptor. Stops descending at the first
+	/// directory that holds any .uplugin (plugins do not nest), and never walks into
+	/// a plugin's own Content/Source/Binaries/Intermediate, so a large Plugins tree
+	/// costs a handful of directory listings rather than a full file scan.
+	/// </summary>
+	private static string FindUpluginUnder(string Dir, string UpluginName)
+	{
+		if (!Directory.Exists(Dir))
 		{
-			return true;
+			return null;
 		}
 
-		// 3. Engine Plugins/Flow (manual engine-side install)
-		return HasFlowUplugin(Path.Combine(engineDir, "Plugins", "Flow"));
+		string[] Descriptors = Directory.GetFiles(Dir, "*.uplugin", SearchOption.TopDirectoryOnly);
+		if (Descriptors.Length > 0)
+		{
+			foreach (string Descriptor in Descriptors)
+			{
+				if (string.Equals(Path.GetFileName(Descriptor), UpluginName, System.StringComparison.OrdinalIgnoreCase))
+				{
+					return Descriptor;
+				}
+			}
+			return null;
+		}
+
+		foreach (string Child in Directory.GetDirectories(Dir))
+		{
+			string Name = Path.GetFileName(Child);
+			if (Name.StartsWith(".") || Name == "Binaries" || Name == "Intermediate" || Name == "Saved")
+			{
+				continue;
+			}
+
+			string Found = FindUpluginUnder(Child, UpluginName);
+			if (Found != null)
+			{
+				return Found;
+			}
+		}
+		return null;
 	}
 }
